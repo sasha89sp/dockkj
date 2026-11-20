@@ -1,0 +1,6 @@
+{
+  "name": "AeroDock",
+  "description": "Настраиваемая док-панель запуска приложений в стиле RocketDock с физикой увеличения, темами оформления, стеками и встроенными мини-приложениями.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

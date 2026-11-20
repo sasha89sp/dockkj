@@ -1,0 +1,80 @@
+name: Build AeroDock Windows Portable
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: flutter_windows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter (3.29.3 stable)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: 'stable'
+          cache: true
+
+      - name: Enable Windows Desktop, init runner & apply custom .ico
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          if (-not (Test-Path "windows")) {
+            flutter create --platforms=windows --project-name aerodock .
+          }
+          if (Test-Path "test/widget_test.dart") {
+            Remove-Item -Force "test/widget_test.dart"
+          }
+          if (Test-Path "assets/app_icon.ico") {
+            Copy-Item -Force "assets/app_icon.ico" "windows/runner/resources/app_icon.ico"
+          }
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Windows Release (.exe)
+        run: flutter build windows --release
+
+      - name: Package Portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/AeroDock-Portable" | Out-Null
+          Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" "dist/AeroDock-Portable/"
+          if (Test-Path "aerodock-config.json") {
+            Copy-Item -Force "aerodock-config.json" "dist/AeroDock-Portable/aerodock-config.json"
+          }
+          if (Test-Path "README-FLUTTER-RU.txt") {
+            Copy-Item -Force "README-FLUTTER-RU.txt" "dist/AeroDock-Portable/README-RU.txt"
+          }
+          Compress-Archive -Path "dist/AeroDock-Portable/*" -DestinationPath "dist/AeroDock-Windows-Portable-x64.zip" -Force
+
+      - name: Upload Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AeroDock-Windows-Portable-x64
+          path: flutter_windows/dist/AeroDock-Windows-Portable-x64.zip
+          retention-days: 30
+
+      - name: Publish GitHub Release (on tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag "dist/AeroDock-Windows-Portable-x64.zip" `
+            --title "AeroDock Portable $tag" `
+            --notes "Портативная сборка AeroDock на Flutter для Windows x64. Распакуйте и запустите aerodock.exe."
