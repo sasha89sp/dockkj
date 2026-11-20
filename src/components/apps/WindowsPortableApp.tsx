@@ -57,7 +57,7 @@ const POSITION_LABELS: Record<DockSettings['position'], string> = {
 const FLUTTER_ARCHIVE_FILES = [
   {
     name: '.github/workflows/build-windows-portable.yml',
-    role: 'GitHub Actions: сборка aerodock.exe на windows-latest + установка app_icon.ico + Release',
+    role: 'GitHub Actions: сборка aerodock.exe на windows-2022 + установка app_icon.ico + Release',
   },
   {
     name: 'lib/main.dart',
@@ -479,7 +479,7 @@ export const WindowsPortableApp: React.FC<WindowsPortableAppProps> = ({
                 <li className="flex gap-2.5">
                   <span className="font-mono text-sky-400 shrink-0">2.</span>
                   <span>
-                    Откройте вкладку <span className="font-mono text-slate-100">Actions → Build AeroDock Windows Portable</span>: GitHub сам соберёт <span className="font-mono text-slate-100">aerodock.exe</span> на <span className="font-mono text-slate-100">windows-latest</span> без установки Flutter на ваш ПК.
+                    Откройте вкладку <span className="font-mono text-slate-100">Actions → Build AeroDock Windows Portable</span>: GitHub сам соберёт <span className="font-mono text-slate-100">aerodock.exe</span> на <span className="font-mono text-slate-100">windows-2022</span> без установки Flutter на ваш ПК.
                   </span>
                 </li>
                 <li className="flex gap-2.5">

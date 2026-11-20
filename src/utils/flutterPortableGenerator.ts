@@ -2351,7 +2351,8 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # windows-2022 includes Visual Studio 2022 (MSVC 17), required by Flutter 3.29.3
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
