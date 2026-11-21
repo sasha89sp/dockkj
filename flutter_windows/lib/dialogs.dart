@@ -2692,8 +2692,8 @@ class _IconSettingsDialogState extends State<IconSettingsDialog> {
                               borderRadius: BorderRadius.circular(14),
                               border: Border.all(color: Colors.white24),
                             ),
-                            child: activeCustomPath != null && File(activeCustomPath).existsSync()
-                                ? Image.file(File(activeCustomPath), fit: BoxFit.contain)
+                            child: safeFileExists(activeCustomPath)
+                                ? Image.file(File(activeCustomPath!), fit: BoxFit.contain)
                                 : DockGlyphTile(
                                     iconKey: _iconKey,
                                     color: parseHexColor(_color),
@@ -3094,7 +3094,7 @@ class LiveStackPopover extends StatelessWidget {
                           child: Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              if (entry.iconPngPath != null && File(entry.iconPngPath!).existsSync())
+                              if (safeFileExists(entry.iconPngPath))
                                 Image.file(
                                   File(entry.iconPngPath!),
                                   width: 36,

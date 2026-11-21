@@ -141,9 +141,9 @@ class RecycleBinDockletIcon extends StatelessWidget {
     final customPath = isFull ? (item.iconPathAlt ?? item.iconPath) : item.iconPath;
 
     Widget visual;
-    if (customPath != null && File(customPath).existsSync()) {
+    if (safeFileExists(customPath)) {
       visual = Image(
-        image: ResizeImage(FileImage(File(customPath)), width: 160),
+        image: ResizeImage(FileImage(File(customPath!)), width: 160),
         width: size,
         height: size,
         fit: BoxFit.contain,

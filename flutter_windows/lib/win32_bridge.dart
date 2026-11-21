@@ -1371,37 +1371,58 @@ class Win32Bridge {
   /// Skips Windows UWP stub icons (calc.exe) so built-in crisp HD vector icons are used instead!
   static String? extractIconToPng(String targetPath, Directory iconsCacheDir) {
     if (!Platform.isWindows || targetPath.trim().isEmpty) return null;
-    if (targetPath.startsWith('http://') || targetPath.startsWith('https://')) {
+    final trimmed = targetPath.trim();
+    final lower = trimmed.toLowerCase();
+    if (lower.contains('://') ||
+        lower.startsWith('shell:') ||
+        lower.startsWith('mailto:') ||
+        lower.startsWith('ms-') ||
+        lower.startsWith('::')) {
       return null;
     }
+    final firstColon = trimmed.indexOf(':');
+    if (firstColon >= 0 && (firstColon != 1 || trimmed.indexOf(':', 2) >= 0)) {
+      return null;
+    }
+
     // Skip ugly low-res UWP stub icons where our built-in Aero HD icons look far sharper
-    final lowerBase = p.basename(targetPath).toLowerCase();
+    final lowerBase = p.basename(trimmed).toLowerCase();
     if (lowerBase == 'calc.exe' || lowerBase == 'cmd.exe') {
       return null;
     }
 
-    if (!iconsCacheDir.existsSync()) {
-      iconsCacheDir.createSync(recursive: true);
+    try {
+      if (!iconsCacheDir.existsSync()) {
+        iconsCacheDir.createSync(recursive: true);
+      }
+    } catch (_) {
+      return null;
     }
 
-    final safeHash = targetPath.toLowerCase().codeUnits.fold<int>(
+    final safeHash = trimmed.toLowerCase().codeUnits.fold<int>(
           2166136261,
           (h, c) => ((h ^ c) * 16777619) & 0x7FFFFFFF,
         );
     final outFile = File(p.join(iconsCacheDir.path, 'hd128_$safeHash.png'));
-    if (outFile.existsSync() && outFile.lengthSync() > 120) {
-      return outFile.path;
-    }
+    try {
+      if (outFile.existsSync() && outFile.lengthSync() > 120) {
+        return outFile.path;
+      }
+    } catch (_) {}
 
-    var resolved = targetPath;
+    var resolved = trimmed;
     if (!resolved.contains('\\') && !resolved.contains('/')) {
       final sysRoot = Platform.environment['SystemRoot'] ?? r'C:\Windows';
       final sys32 = p.join(sysRoot, 'System32', resolved);
-      if (File(sys32).existsSync()) {
-        resolved = sys32;
-      } else {
-        final winDir = p.join(sysRoot, resolved);
-        if (File(winDir).existsSync()) resolved = winDir;
+      try {
+        if (File(sys32).existsSync()) {
+          resolved = sys32;
+        } else {
+          final winDir = p.join(sysRoot, resolved);
+          if (File(winDir).existsSync()) resolved = winDir;
+        }
+      } catch (_) {
+        return null;
       }
     }
 

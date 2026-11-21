@@ -750,6 +750,8 @@ class _DockShellPageState extends State<DockShellPage>
         await _syncWindowGeometry();
         await _ensureDockVisible();
       }
+    } catch (e, st) {
+      _logRuntimeError(e, st);
     } finally {
       _syncInFlight = false;
     }
@@ -1352,7 +1354,7 @@ class _DockShellPageState extends State<DockShellPage>
           item.target.isNotEmpty) {
         // Re-extract if missing OR if still pointing to an old blurry 32px ico_* cache file
         final needsUpgrade = item.iconPath == null ||
-            !File(item.iconPath!).existsSync() ||
+            !safeFileExists(item.iconPath) ||
             p.basename(item.iconPath!).startsWith('ico_');
         if (needsUpgrade) {
           final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
@@ -1418,7 +1420,7 @@ class _DockShellPageState extends State<DockShellPage>
         await _openOverlay(_ActiveOverlay.calendar);
         return;
       case 'docklet_stack':
-        if (item.target.isNotEmpty && Directory(item.target).existsSync()) {
+        if (safeDirExists(item.target)) {
           _openStackItem = item;
           _stackEntries = await Win32Bridge.listDirectoryContents(
             item.target,
@@ -1559,8 +1561,7 @@ class _DockShellPageState extends State<DockShellPage>
         return;
       }
       if ((targetItem.type == 'path' || targetItem.type == 'docklet_stack') &&
-          targetItem.target.isNotEmpty &&
-          Directory(targetItem.target).existsSync()) {
+          safeDirExists(targetItem.target)) {
         await Win32Bridge.copyFilesToFolder(paths, targetItem.target);
         _triggerClickEffect(targetItem.id);
         return;
@@ -1580,7 +1581,7 @@ class _DockShellPageState extends State<DockShellPage>
     }
 
     for (final filePath in paths) {
-      final isDir = FileSystemEntity.isDirectorySync(filePath);
+      final isDir = safeIsDirectory(filePath);
       final name = isDir ? p.basename(filePath) : p.basenameWithoutExtension(filePath);
       final png = Win32Bridge.extractIconToPng(filePath, widget.store.iconsCacheDir);
       _items.add(
@@ -2054,7 +2055,7 @@ class _DockShellPageState extends State<DockShellPage>
     final alpha = (_cfg.bgOpacity / 100.0).clamp(0.0, 1.0);
     if (_cfg.theme.startsWith('skin:')) {
       final skin = _externalSkins.where((s) => s.id == _cfg.theme).firstOrNull;
-      if (skin != null && File(skin.imagePath).existsSync()) {
+      if (skin != null && safeFileExists(skin.imagePath)) {
         return BoxDecoration(
           borderRadius: BorderRadius.circular(18),
           image: DecorationImage(
@@ -2743,7 +2744,7 @@ class _DockShellPageState extends State<DockShellPage>
         clipBehavior: Clip.none,
         alignment: Alignment.center,
         children: [
-          if (entry.iconPngPath != null && File(entry.iconPngPath!).existsSync())
+          if (safeFileExists(entry.iconPngPath))
             Image(
               image: ResizeImage(FileImage(File(entry.iconPngPath!)), width: 160),
               width: base,
@@ -2855,7 +2856,7 @@ class _DockShellPageState extends State<DockShellPage>
         break;
     }
 
-    if (item.iconPath != null && File(item.iconPath!).existsSync()) {
+    if (safeFileExists(item.iconPath)) {
       return Image(
         image: ResizeImage(FileImage(File(item.iconPath!)), width: 160),
         width: size,

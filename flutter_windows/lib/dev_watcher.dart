@@ -281,9 +281,8 @@ class DevArchiveWatcher {
       if (existingIdx >= 0) {
         // Keep custom user-picked icon if they explicitly chose one outside cache
         final prevIcon = devItems[existingIdx].iconPath;
-        if (prevIcon != null &&
-            File(prevIcon).existsSync() &&
-            !prevIcon.startsWith(store.iconsCacheDir.path)) {
+        if (safeFileExists(prevIcon) &&
+            !prevIcon!.startsWith(store.iconsCacheDir.path)) {
           item.iconPath = prevIcon;
         }
         devItems[existingIdx] = item;

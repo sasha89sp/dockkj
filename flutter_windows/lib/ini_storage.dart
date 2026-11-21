@@ -561,6 +561,74 @@ class BackupEntry {
 }
 
 // ============================================================================
+// Windows-Safe Filesystem Helpers (Prevents OS Error 123 on URLs / shell: / ::)
+// ============================================================================
+
+/// Returns true if [raw] is a URL, Windows shell URI, CLSID, or contains characters
+/// illegal in a Windows filesystem path (which cause `File.existsSync()` to throw errno 123!).
+bool isNonFileScheme(String? raw) {
+  if (raw == null) return true;
+  final s = raw.trim();
+  if (s.isEmpty) return true;
+  final lower = s.toLowerCase();
+  if (lower.contains('://') ||
+      lower.startsWith('shell:') ||
+      lower.startsWith('mailto:') ||
+      lower.startsWith('ms-') ||
+      lower.startsWith('::')) {
+    return true;
+  }
+  final check = s.startsWith(r'\\?\') ? s.substring(4) : s;
+  final firstColon = check.indexOf(':');
+  if (firstColon >= 0) {
+    // Only a Windows drive letter (`C:\...` or `C:/...`) may contain `:` at index 1
+    final isAsciiLetter = check.isNotEmpty &&
+        ((check.codeUnitAt(0) >= 65 && check.codeUnitAt(0) <= 90) ||
+            (check.codeUnitAt(0) >= 97 && check.codeUnitAt(0) <= 122));
+    if (firstColon != 1 || !isAsciiLetter) return true;
+    if (check.indexOf(':', 2) >= 0) return true;
+  }
+  for (var i = 0; i < check.length; i++) {
+    final c = check.codeUnitAt(i);
+    // Reject control chars and Windows-illegal filename chars: < > " | ? *
+    if (c < 32 || c == 60 || c == 62 || c == 34 || c == 124 || c == 63 || c == 42) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Windows-safe `File(path).existsSync()` that NEVER throws `FileSystemException (errno 123)`.
+bool safeFileExists(String? path) {
+  if (isNonFileScheme(path)) return false;
+  try {
+    return File(path!.trim()).existsSync();
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Windows-safe `Directory(path).existsSync()` that NEVER throws `FileSystemException (errno 123)`.
+bool safeDirExists(String? path) {
+  if (isNonFileScheme(path)) return false;
+  try {
+    return Directory(path!.trim()).existsSync();
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Windows-safe `FileSystemEntity.isDirectorySync(path)` that NEVER throws on URLs/shell: URIs.
+bool safeIsDirectory(String? path) {
+  if (isNonFileScheme(path)) return false;
+  try {
+    return FileSystemEntity.isDirectorySync(path!.trim());
+  } catch (_) {
+    return false;
+  }
+}
+
+// ============================================================================
 // Portable Settings.ini Store + RocketDock 1.3.5 Importer + Auto-Backup
 // ============================================================================
 
@@ -640,15 +708,19 @@ class PortableIniStore {
       final rest = trimmed.substring(_appDirToken.length).replaceFirst(RegExp(r'^[\\/]+'), '');
       return rest.isEmpty ? portableDir.path : p.join(portableDir.path, rest);
     }
+    // Never touch the filesystem for URLs (https://...), shell: URIs, or CLSIDs —
+    // on Windows, File('https://...').existsSync() throws FileSystemException (errno = 123)!
+    if (isNonFileScheme(trimmed)) return trimmed;
+
     // If user copied Settings.ini from an old AeroDock folder, auto-remap DevApps / Icons / Skins if missing at old path
-    if (!File(trimmed).existsSync() && !Directory(trimmed).existsSync()) {
+    if (!safeFileExists(trimmed) && !safeDirExists(trimmed)) {
       final lower = trimmed.toLowerCase();
       for (final sub in [r'\icons\', r'\skins\', r'\docklets\', r'\languages\', r'\devapps']) {
         final idx = lower.indexOf(sub);
         if (idx >= 0) {
           final rel = trimmed.substring(idx + 1);
           final candidate = p.join(portableDir.path, rel);
-          if (sub == r'\devapps' || File(candidate).existsSync() || Directory(candidate).existsSync()) {
+          if (sub == r'\devapps' || safeFileExists(candidate) || safeDirExists(candidate)) {
             return candidate;
           }
         }
@@ -995,10 +1067,12 @@ class PortableIniStore {
     if (raw == null || raw.trim().isEmpty) return null;
     final cleaned = raw.replaceAll('"', '').trim();
     if (cleaned.isEmpty) return null;
+    if (!cleaned.startsWith(_appDirToken) && isNonFileScheme(cleaned)) return null;
 
-    final baseName = p.basename(cleaned);
+    final expanded = fromPortablePath(cleaned);
+    final baseName = p.basename(expanded);
     final candidates = <String>[
-      fromPortablePath(cleaned),
+      expanded,
       cleaned,
       p.join(sourceBaseDir, cleaned),
       p.join(sourceBaseDir, 'Icons', cleaned),
@@ -1017,14 +1091,10 @@ class PortableIniStore {
 
     File? found;
     for (final c in candidates) {
-      if (c.isEmpty) continue;
-      try {
-        final f = File(c);
-        if (f.existsSync()) {
-          found = f;
-          break;
-        }
-      } catch (_) {}
+      if (safeFileExists(c)) {
+        found = File(c.trim());
+        break;
+      }
     }
     if (found == null) return null;
 
@@ -1060,35 +1130,39 @@ class PortableIniStore {
     final count = _int(itemsSec['Count'], 0);
     final list = <DockItemModel>[];
     for (var i = 0; i < count; i++) {
-      final prefix = 'Item$i';
-      final type = itemsSec['$prefix.Type'];
-      if (type == null || type.isEmpty) continue;
-      final rawIcon = _emptyToNull(itemsSec['$prefix.IconPath']);
-      final rawAlt = _emptyToNull(itemsSec['$prefix.IconPathAlt']);
-      final resolvedIcon = sourceBaseDir != null
-          ? _importIconAsset(rawIcon, sourceBaseDir)
-          : (rawIcon != null ? fromPortablePath(rawIcon) : null);
-      final resolvedAlt = sourceBaseDir != null
-          ? _importIconAsset(rawAlt, sourceBaseDir)
-          : (rawAlt != null ? fromPortablePath(rawAlt) : null);
-      list.add(
-        DockItemModel(
-          id: itemsSec['$prefix.Id'] ?? 'd${dockId}_$i',
-          type: type,
-          title: itemsSec['$prefix.Title'] ?? '',
-          target: fromPortablePath(itemsSec['$prefix.Target'] ?? ''),
-          startIn: fromPortablePath(itemsSec['$prefix.StartIn'] ?? ''),
-          args: itemsSec['$prefix.Args'] ?? '',
-          runMode: itemsSec['$prefix.RunMode'] ?? 'normal',
-          openRunning: itemsSec['$prefix.OpenRunning'] ?? 'global',
-          popupMenu: _bool(itemsSec['$prefix.PopupMenu'], true),
-          iconKey: itemsSec['$prefix.IconKey'] ?? 'rocket',
-          color: itemsSec['$prefix.Color'] ?? '#0284C7',
-          iconPath: resolvedIcon,
-          iconPathAlt: resolvedAlt,
-          devRuleId: _emptyToNull(itemsSec['$prefix.DevRuleId']),
-        ),
-      );
+      try {
+        final prefix = 'Item$i';
+        final type = itemsSec['$prefix.Type'];
+        if (type == null || type.isEmpty) continue;
+        final rawIcon = _emptyToNull(itemsSec['$prefix.IconPath']);
+        final rawAlt = _emptyToNull(itemsSec['$prefix.IconPathAlt']);
+        final resolvedIcon = sourceBaseDir != null
+            ? _importIconAsset(rawIcon, sourceBaseDir)
+            : (rawIcon != null ? fromPortablePath(rawIcon) : null);
+        final resolvedAlt = sourceBaseDir != null
+            ? _importIconAsset(rawAlt, sourceBaseDir)
+            : (rawAlt != null ? fromPortablePath(rawAlt) : null);
+        list.add(
+          DockItemModel(
+            id: itemsSec['$prefix.Id'] ?? 'd${dockId}_$i',
+            type: type,
+            title: itemsSec['$prefix.Title'] ?? '',
+            target: fromPortablePath(itemsSec['$prefix.Target'] ?? ''),
+            startIn: fromPortablePath(itemsSec['$prefix.StartIn'] ?? ''),
+            args: itemsSec['$prefix.Args'] ?? '',
+            runMode: itemsSec['$prefix.RunMode'] ?? 'normal',
+            openRunning: itemsSec['$prefix.OpenRunning'] ?? 'global',
+            popupMenu: _bool(itemsSec['$prefix.PopupMenu'], true),
+            iconKey: itemsSec['$prefix.IconKey'] ?? 'rocket',
+            color: itemsSec['$prefix.Color'] ?? '#0284C7',
+            iconPath: resolvedIcon,
+            iconPathAlt: resolvedAlt,
+            devRuleId: _emptyToNull(itemsSec['$prefix.DevRuleId']),
+          ),
+        );
+      } catch (_) {
+        // Never allow a single malformed item to abort loading the dock or other panels
+      }
     }
     return list;
   }
@@ -1402,17 +1476,19 @@ class PortableIniStore {
 
         final themeName = getCI('Theme');
         if (themeName != null && themeName.isNotEmpty) {
-          final localSkin = Directory(p.join(skinsDir.path, themeName));
-          if (!localSkin.existsSync()) {
-            // Try copying matching skin from source RocketDock/Skins/<Theme>
-            final srcSkin = Directory(p.join(baseDir, 'Skins', themeName));
-            if (srcSkin.existsSync()) {
-              await _copyDirFiles(srcSkin, localSkin);
+          try {
+            final localSkinPath = p.join(skinsDir.path, themeName);
+            if (!safeDirExists(localSkinPath)) {
+              // Try copying matching skin from source RocketDock/Skins/<Theme>
+              final srcSkinPath = p.join(baseDir, 'Skins', themeName);
+              if (safeDirExists(srcSkinPath)) {
+                await _copyDirFiles(Directory(srcSkinPath), Directory(localSkinPath));
+              }
             }
-          }
-          if (localSkin.existsSync()) {
-            panel.theme = 'skin:$themeName';
-          }
+            if (safeDirExists(localSkinPath)) {
+              panel.theme = 'skin:$themeName';
+            }
+          } catch (_) {}
         }
 
         panels[targetDockId] = panel;
@@ -1470,7 +1546,7 @@ class PortableIniStore {
         } else if (cmdLower.startsWith('http://') || cmdLower.startsWith('https://')) {
           type = 'blank';
           iconKey = 'globe';
-        } else if (cmd.isNotEmpty && FileSystemEntity.isDirectorySync(cmd)) {
+        } else if (cmd.isNotEmpty && safeIsDirectory(cmd)) {
           type = 'path';
           iconKey = 'folder-blue';
           color = '#2563EB';
