@@ -745,9 +745,10 @@ class _DockShellPageState extends State<DockShellPage>
           return;
         }
         _extractMissingIcons();
+        if (mounted) setState(() {});
         _applyLayerAndAcrylic();
         await _syncWindowGeometry();
-        if (mounted) setState(() {});
+        await _ensureDockVisible();
       }
     } finally {
       _syncInFlight = false;
@@ -850,20 +851,17 @@ class _DockShellPageState extends State<DockShellPage>
         await _importRocketDock135ViaPicker();
         break;
       case 'toggle_dock2':
-        widget.store.global.dock2Enabled = !widget.store.global.dock2Enabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.dock2Enabled = !g.dock2Enabled);
         await _reconcileSiblingDocks();
         await _rebuildTrayMenu();
         break;
       case 'toggle_dock3':
-        widget.store.global.dock3Enabled = !widget.store.global.dock3Enabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.dock3Enabled = !g.dock3Enabled);
         await _reconcileSiblingDocks();
         await _rebuildTrayMenu();
         break;
       case 'toggle_dock4':
-        widget.store.global.devDockEnabled = !widget.store.global.devDockEnabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.devDockEnabled = !g.devDockEnabled);
         await _reconcileSiblingDocks();
         await _rebuildTrayMenu();
         break;
@@ -975,8 +973,13 @@ class _DockShellPageState extends State<DockShellPage>
         if (widget.store.global.excludedWindows.contains(w.processName)) continue;
 
         if (ctrlAltShift && w.processName.isNotEmpty) {
-          widget.store.global.excludedWindows.add(w.processName);
-          widget.store.save();
+          final procName = w.processName;
+          widget.store.global.excludedWindows.add(procName);
+          unawaited(widget.store.saveGlobalChange((g) {
+            if (!g.excludedWindows.contains(procName)) {
+              g.excludedWindows.add(procName);
+            }
+          }));
           continue;
         }
         if (ctrlOnly) {
@@ -1362,7 +1365,11 @@ class _DockShellPageState extends State<DockShellPage>
     }
     if (changed && mounted) {
       setState(() {});
-      widget.store.save();
+      // Never overwrite Settings.ini while standalone Settings window is open,
+      // and always merge ONLY this dock's items so panel positions are never clobbered!
+      if (_settingsProcess == null) {
+        unawaited(widget.store.saveDockItemsOnly(_dockId, skipProfileSync: true));
+      }
     }
   }
 
@@ -1483,20 +1490,27 @@ class _DockShellPageState extends State<DockShellPage>
 
   Future<void> _importRocketDock135ViaPicker() async {
     final res = await FilePicker.platform.pickFiles(
-      dialogTitle: 'Выберите Settings.ini из RocketDock 1.3.5',
+      dialogTitle: 'Выберите Settings.ini (RocketDock 1.3.5 или AeroDock)',
       type: FileType.custom,
-      allowedExtensions: ['ini'],
+      allowedExtensions: ['ini', 'reg'],
     );
     if (res == null || res.files.single.path == null) return;
     final importRes = await widget.store.importRocketDock135Ini(
       File(res.files.single.path!),
       targetDockId: _dockId,
     );
+    AppI18n.currentCode = widget.store.global.language;
+    _externalSkins = widget.store.scanExternalSkins();
+    await _refreshDisplaysAndWorkArea();
+    if (_isPrimary) {
+      await _reconcileSiblingDocks();
+      await _rebuildTrayMenu();
+    }
     _extractMissingIcons();
+    if (mounted) setState(() {});
     _applyLayerAndAcrylic();
     await _syncWindowGeometry();
     _showToast(importRes.message);
-    if (mounted) setState(() {});
   }
 
   Future<void> _handleExternalDrop(DropDoneDetails details) async {
@@ -1505,7 +1519,8 @@ class _DockShellPageState extends State<DockShellPage>
     if (paths.isEmpty) return;
 
     // Auto-import RocketDock 1.3.5 OR AeroDock Settings.ini if dropped directly onto the dock!
-    if (paths.length == 1 && p.extension(paths.first).toLowerCase() == '.ini') {
+    final firstExt = p.extension(paths.first).toLowerCase();
+    if (paths.length == 1 && (firstExt == '.ini' || firstExt == '.reg')) {
       try {
         final iniFile = File(paths.first);
         final sections = PortableIniStore.parseIniText(
@@ -1517,11 +1532,18 @@ class _DockShellPageState extends State<DockShellPage>
             iniFile,
             targetDockId: _dockId,
           );
+          AppI18n.currentCode = widget.store.global.language;
+          _externalSkins = widget.store.scanExternalSkins();
+          await _refreshDisplaysAndWorkArea();
+          if (_isPrimary) {
+            await _reconcileSiblingDocks();
+            await _rebuildTrayMenu();
+          }
           _extractMissingIcons();
+          if (mounted) setState(() {});
           _applyLayerAndAcrylic();
           await _syncWindowGeometry();
           _showToast(importRes.message);
-          if (mounted) setState(() {});
           return;
         }
       } catch (_) {}
@@ -1575,7 +1597,7 @@ class _DockShellPageState extends State<DockShellPage>
       );
     }
 
-    await widget.store.save();
+    await widget.store.saveDockItemsOnly(_dockId);
     setState(() {});
     await _syncWindowGeometry();
   }
@@ -1584,7 +1606,10 @@ class _DockShellPageState extends State<DockShellPage>
   /// and update visually in real time as the user adjusts size, edge, theme, or zoom!
   Future<void> _openSettingsTab(int tab) async {
     try {
-      await widget.store.save(skipProfileSync: true);
+      // Never overwrite Settings.ini with potentially stale memory before launching --settings!
+      if (await widget.store.hasExternalChanges()) {
+        await widget.store.reloadFromDisk();
+      }
       if (_settingsProcess != null) {
         try {
           _settingsProcess!.kill();
@@ -1765,7 +1790,7 @@ class _DockShellPageState extends State<DockShellPage>
       case 'item_delete':
         if (item != null) {
           _items.removeWhere((e) => e.id == item.id);
-          await widget.store.save();
+          await widget.store.saveDockItemsOnly(_dockId);
           setState(() {});
           await _syncWindowGeometry();
         }
@@ -1783,7 +1808,7 @@ class _DockShellPageState extends State<DockShellPage>
             startIn: p.dirname(path),
             iconPath: png,
           ));
-          await widget.store.save();
+          await widget.store.saveDockItemsOnly(_dockId);
           setState(() {});
           await _syncWindowGeometry();
         }
@@ -1799,7 +1824,7 @@ class _DockShellPageState extends State<DockShellPage>
             iconKey: 'folder-blue',
             color: '#2563EB',
           ));
-          await widget.store.save();
+          await widget.store.saveDockItemsOnly(_dockId);
           setState(() {});
           await _syncWindowGeometry();
         }
@@ -1815,7 +1840,7 @@ class _DockShellPageState extends State<DockShellPage>
           type: 'separator',
           title: 'Разделитель',
         ));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
@@ -1827,7 +1852,7 @@ class _DockShellPageState extends State<DockShellPage>
           target: 'shell:RecycleBinFolder',
           iconKey: 'trash',
         ));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         _pollRecycleBinNow();
         setState(() {});
         await _syncWindowGeometry();
@@ -1840,7 +1865,7 @@ class _DockShellPageState extends State<DockShellPage>
           iconKey: 'settings',
           color: '#475569',
         ));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
@@ -1852,33 +1877,33 @@ class _DockShellPageState extends State<DockShellPage>
           iconKey: 'power',
           color: '#E11D48',
         ));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_clock':
         _items.add(DockItemModel(id: 'dk_clk_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_clock', title: 'Часы', iconKey: 'clock'));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_battery':
         _items.add(DockItemModel(id: 'dk_bat_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_battery', title: 'Батарея', iconKey: 'star'));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         _pollStatsNow();
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_sysstats':
         _items.add(DockItemModel(id: 'dk_sys_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_sysstats', title: 'CPU / RAM', iconKey: 'terminal'));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         _pollStatsNow();
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_calendar':
         _items.add(DockItemModel(id: 'dk_cal_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_calendar', title: 'Календарь', iconKey: 'book'));
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
@@ -1893,7 +1918,7 @@ class _DockShellPageState extends State<DockShellPage>
             iconKey: 'folder-emerald',
             color: '#059669',
           ));
-          await widget.store.save();
+          await widget.store.saveDockItemsOnly(_dockId);
           setState(() {});
           await _syncWindowGeometry();
         }
@@ -1903,19 +1928,18 @@ class _DockShellPageState extends State<DockShellPage>
       case 'pos_left':
       case 'pos_right':
         _cfg.position = choice.substring(4);
-        await widget.store.save();
+        await widget.store.savePanelConfigOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'toggle_lock':
-        widget.store.global.lockItems = !widget.store.global.lockItems;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.lockItems = !g.lockItems);
         setState(() {});
         break;
       case 'toggle_autohide':
         _cfg.autoHide = !_cfg.autoHide;
         _isAutoHidden = false;
-        await widget.store.save();
+        await widget.store.savePanelConfigOnly(_dockId);
         setState(() {});
         await _syncWindowGeometry();
         break;
@@ -1962,8 +1986,7 @@ class _DockShellPageState extends State<DockShellPage>
         }
         break;
       case 'toggle_dock2':
-        widget.store.global.dock2Enabled = !widget.store.global.dock2Enabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.dock2Enabled = !g.dock2Enabled);
         if (_isPrimary) {
           await _reconcileSiblingDocks();
           await _rebuildTrayMenu();
@@ -1971,8 +1994,7 @@ class _DockShellPageState extends State<DockShellPage>
         setState(() {});
         break;
       case 'toggle_dock3':
-        widget.store.global.dock3Enabled = !widget.store.global.dock3Enabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.dock3Enabled = !g.dock3Enabled);
         if (_isPrimary) {
           await _reconcileSiblingDocks();
           await _rebuildTrayMenu();
@@ -1980,8 +2002,7 @@ class _DockShellPageState extends State<DockShellPage>
         setState(() {});
         break;
       case 'toggle_dock4':
-        widget.store.global.devDockEnabled = !widget.store.global.devDockEnabled;
-        await widget.store.save();
+        await widget.store.saveGlobalChange((g) => g.devDockEnabled = !g.devDockEnabled);
         if (_isPrimary) {
           await _reconcileSiblingDocks();
           await _rebuildTrayMenu();
@@ -2016,7 +2037,7 @@ class _DockShellPageState extends State<DockShellPage>
               iconPath: ext.iconPath,
               iconKey: 'rocket',
             ));
-            await widget.store.save();
+            await widget.store.saveDockItemsOnly(_dockId);
             setState(() {});
             await _syncWindowGeometry();
           }
@@ -2231,7 +2252,7 @@ class _DockShellPageState extends State<DockShellPage>
                   } else {
                     _items.add(saved);
                   }
-                  await widget.store.save();
+                  await widget.store.saveDockItemsOnly(_dockId);
                   _pollStatsNow();
                   _pollRecycleBinNow();
                   await _closeOverlay();
@@ -2663,7 +2684,7 @@ class _DockShellPageState extends State<DockShellPage>
         if (from == index || from < 0 || from >= _items.length) return;
         final moved = _items.removeAt(from);
         _items.insert(index, moved);
-        await widget.store.save();
+        await widget.store.saveDockItemsOnly(_dockId);
         setState(() {});
       },
       builder: (context, _, __) {
@@ -2684,7 +2705,7 @@ class _DockShellPageState extends State<DockShellPage>
                 final origin = box.localToGlobal(Offset.zero);
                 if ((details.offset - origin).distance > base * 1.9) {
                   _items.removeWhere((e) => e.id == item.id);
-                  await widget.store.save();
+                  await widget.store.saveDockItemsOnly(_dockId);
                   setState(() {});
                   await _syncWindowGeometry();
                 }

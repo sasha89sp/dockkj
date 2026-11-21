@@ -25,8 +25,8 @@ class DockSettingsDialog extends StatefulWidget {
   final DevArchiveWatcher? devWatcher;
   final bool isStandaloneWindow;
   final VoidCallback onSaved;
-  final VoidCallback onResetDefaults;
-  final VoidCallback onFullReset;
+  final FutureOr<void> Function() onResetDefaults;
+  final FutureOr<void> Function() onFullReset;
   final VoidCallback onClose;
 
   const DockSettingsDialog({
@@ -172,7 +172,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
         widget.store.panels[id] = _panels[id]!.copy();
       }
       AppI18n.currentCode = _global.language;
-      await widget.store.save(skipProfileSync: true);
+      await widget.store.save(skipProfileSync: true, preserveDiskItems: true);
       widget.onSaved();
     } finally {
       _applyingLive = false;
@@ -185,6 +185,13 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
 
   Future<void> _persistDraftToStore() async {
     _liveSaveTimer?.cancel();
+    _pendingLive = false;
+    // Wait for any in-flight live preview write to finish cleanly first
+    var guard = 0;
+    while (_applyingLive && guard < 40) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      guard++;
+    }
     _syncTextControllersToDraft();
     widget.store.global = _global.copy();
     widget.store.devSettings = _dev.copy();
@@ -194,7 +201,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     }
     AppI18n.currentCode = _global.language;
     await Win32Bridge.setStartupEnabled(_global.launchWithWindows);
-    await widget.store.save();
+    await widget.store.save(preserveDiskItems: true);
     widget.onSaved();
   }
 
@@ -206,10 +213,17 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
 
   Future<void> _cancelAndRevert() async {
     _liveSaveTimer?.cancel();
+    _pendingLive = false;
+    var guard = 0;
+    while (_applyingLive && guard < 40) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      guard++;
+    }
     if (_liveDirty && _initialIniSnapshot != null) {
       try {
         await widget.store.iniFile.writeAsString(_initialIniSnapshot!, flush: true);
         await widget.store.reloadFromDisk();
+        await widget.store.save();
         widget.onSaved();
       } catch (_) {}
     }
@@ -269,13 +283,13 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
 
   Future<void> _importRocketDock135() async {
     final res = await FilePicker.platform.pickFiles(
-      dialogTitle: 'Выберите Settings.ini из RocketDock 1.3.5',
+      dialogTitle: 'Выберите Settings.ini (RocketDock 1.3.5 или AeroDock)',
       type: FileType.custom,
-      allowedExtensions: ['ini'],
+      allowedExtensions: ['ini', 'reg'],
     );
     if (res == null || res.files.single.path == null) return;
 
-    await _persistDraftToStore();
+    _liveSaveTimer?.cancel();
     final importRes = await widget.store.importRocketDock135Ini(
       File(res.files.single.path!),
       targetDockId: _rdImportTargetDock,
@@ -283,12 +297,16 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       replaceExistingItems: _rdImportReplace,
     );
 
-    // Refresh local drafts from updated store so user sees imported settings immediately
+    // Refresh ALL local drafts & text controllers from the newly imported store!
+    if (!mounted) return;
     setState(() {
       _global = widget.store.global.copy();
-      if (_rdImportTargetDock == 2) _global.dock2Enabled = true;
-      if (_rdImportTargetDock == 3) _global.dock3Enabled = true;
-      if (_rdImportTargetDock == 4) _global.devDockEnabled = true;
+      _dev = widget.store.devSettings.copy();
+      _backup = widget.store.backupSettings.copy();
+      _watchFolderCtrl.text = _dev.watchFolder;
+      _appsRootCtrl.text = _dev.appsRootFolder;
+      _preserveExtsCtrl.text = _dev.defaultPreserveExts;
+      _backupFolderCtrl.text = _backup.backupFolder;
       for (var id = 1; id <= 4; id++) {
         _panels[id] = (widget.store.panels[id] ?? DockPanelConfig.defaultFor(id)).copy();
       }
@@ -299,8 +317,6 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       _statusIsError = !importRes.ok;
     });
     if (importRes.ok) {
-      widget.store.global = _global.copy();
-      await widget.store.save();
       try {
         _initialIniSnapshot = widget.store.iniFile.readAsStringSync();
       } catch (_) {}
@@ -539,7 +555,8 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   ),
                   const SizedBox(width: 6),
                   IconButton(
-                    onPressed: _cancelAndRevert,
+                    tooltip: 'Сохранить и закрыть',
+                    onPressed: _saveAndClose,
                     icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
                     splashRadius: 16,
                   ),
@@ -690,8 +707,8 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
             child: Row(
               children: [
                 TextButton.icon(
-                  onPressed: () {
-                    widget.onResetDefaults();
+                  onPressed: () async {
+                    await widget.onResetDefaults();
                     widget.onClose();
                   },
                   icon: const Icon(Icons.restore_rounded, size: 16, color: Colors.white70),
@@ -759,7 +776,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               ),
               const SizedBox(height: 5),
               const Text(
-                'Загружает ярлыки, иконки и оформление из оригинального RocketDock 1.3.5 (любые секции [RocketDock] / [Icons] / UTF-16 / Windows-1251) или из другого Settings.ini AeroDock. Также можно перетащить .ini прямо на панель.',
+                'Для Settings.ini AeroDock — переносит СРАЗУ ВСЕ 4 панели, их расположение, настройки и иконки. Для оригинального RocketDock 1.3.5 (.ini / .reg, UTF-16 / Windows-1251) — переносит ярлыки, иконки и положение в выбранную панель. Также можно перетащить .ini прямо на панель.',
                 style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.35),
               ),
               const SizedBox(height: 10),
@@ -854,7 +871,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           AppI18n.t('start_with_windows'),
           'Портативный ярлык в shell:startup (без записи в реестр)',
           _global.launchWithWindows,
-          (v) => setState(() => _global.launchWithWindows = v),
+          (v) {
+            setState(() => _global.launchWithWindows = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('portable_ini'),
@@ -1116,7 +1136,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           'Включить панель «Разработка» и перехват архивов GitHub',
           'Отслеживает загрузки, создаёт папку программы, распаковывает архив, сохраняет старые версии и переносит настройки',
           _global.devDockEnabled,
-          (v) => setState(() => _global.devDockEnabled = v),
+          (v) {
+            setState(() => _global.devDockEnabled = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         const SizedBox(height: 8),
 
@@ -1179,13 +1202,19 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _dev.maxBackupsPerApp.toDouble(),
           1,
           20,
-          (v) => setState(() => _dev.maxBackupsPerApp = v.round()),
+          (v) {
+            setState(() => _dev.maxBackupsPerApp = v.round());
+            _scheduleLiveApply();
+          },
         ),
         _switchRow(
           'Перемещать обработанные архивы в DevApps\\_archives',
           'Очищать папку Downloads после успешной распаковки (выкл — оставить копию в Downloads)',
           _dev.moveArchiveToStorage,
-          (v) => setState(() => _dev.moveArchiveToStorage = v),
+          (v) {
+            setState(() => _dev.moveArchiveToStorage = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         const SizedBox(height: 8),
 
@@ -2188,7 +2217,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
             ElevatedButton.icon(
               onPressed: () async {
                 await widget.store.createBackup(tag: 'pre_reset');
-                widget.onResetDefaults();
+                await widget.onResetDefaults();
                 widget.onClose();
               },
               icon: const Icon(Icons.restore_rounded, size: 15),
@@ -2202,7 +2231,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
             ElevatedButton.icon(
               onPressed: () async {
                 await widget.store.createBackup(tag: 'pre_full_reset');
-                widget.onFullReset();
+                await widget.onFullReset();
                 widget.onClose();
               },
               icon: const Icon(Icons.delete_forever_rounded, size: 15),

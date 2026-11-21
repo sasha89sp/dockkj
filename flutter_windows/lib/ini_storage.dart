@@ -582,6 +582,8 @@ class PortableIniStore {
   final Map<int, List<DockItemModel>> dockItems;
 
   DateTime? lastLoadedModified;
+  String? _lastContentSignature;
+  int _revision = 0;
   bool migratedFromPreviousVersion = false;
 
   PortableIniStore({
@@ -770,6 +772,9 @@ class PortableIniStore {
         await _copyDirFiles(languagesDir, Directory(p.join(dst.path, 'Languages')));
       }
 
+      // Reload latest settings & items from disk before recording LastBackupIso
+      // so delayed auto-backup can NEVER overwrite panel positions with stale memory!
+      await reloadFromDisk();
       backupSettings.lastBackupIso = now.toIso8601String();
       _pruneBackups(root, backupSettings.maxAutoBackups);
       await save(skipProfileSync: true);
@@ -894,14 +899,41 @@ class PortableIniStore {
     return total;
   }
 
+  static String _computeBytesSignature(List<int> bytes) {
+    // Fast 32-bit FNV-1a + exact length — immune to Windows 1-second mtime granularity!
+    var hash = 0x811C9DC5;
+    for (var i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = (hash * 0x01000193) & 0xFFFFFFFF;
+    }
+    return '${bytes.length}:$hash';
+  }
+
   Future<bool> hasExternalChanges() async {
     try {
       if (!await iniFile.exists()) return false;
-      final mod = await iniFile.lastModified();
-      return lastLoadedModified == null || mod.isAfter(lastLoadedModified!);
+      final bytes = await iniFile.readAsBytes();
+      if (bytes.isEmpty) return false;
+      final sig = _computeBytesSignature(bytes);
+      return _lastContentSignature == null || sig != _lastContentSignature;
     } catch (_) {
       return false;
     }
+  }
+
+  static String _unquoteIniValue(String raw) {
+    final s = raw.trim();
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      return s
+          .substring(1, s.length - 1)
+          .replaceAll(r'\\', r'\')
+          .replaceAll(r'\"', '"');
+    }
+    if (s.toLowerCase().startsWith('dword:')) {
+      final parsed = int.tryParse(s.substring(6).trim(), radix: 16);
+      if (parsed != null) return parsed.toString();
+    }
+    return s;
   }
 
   static Map<String, Map<String, String>> parseIniText(String text) {
@@ -917,8 +949,11 @@ class PortableIniStore {
       }
       final idx = line.indexOf('=');
       if (idx <= 0 || currentSection.isEmpty) continue;
-      final k = line.substring(0, idx).trim();
-      final v = line.substring(idx + 1).trim();
+      var k = line.substring(0, idx).trim();
+      if (k.length >= 2 && k.startsWith('"') && k.endsWith('"')) {
+        k = k.substring(1, k.length - 1);
+      }
+      final v = _unquoteIniValue(line.substring(idx + 1));
       sections[currentSection]![k] = v;
     }
     return sections;
@@ -954,8 +989,112 @@ class PortableIniStore {
     return sections.containsKey('Dock1') || sections.containsKey('Dock1-Items');
   }
 
-  /// Import an original RocketDock 1.3.5 Settings.ini (ALL real formats!) OR an AeroDock Settings.ini!
-  /// Supports UTF-16LE (with/without BOM), UTF-8, and Cyrillic ANSI (CP1251).
+  /// Resolve an icon path from an imported INI and copy external icon files into portable Icons/
+  /// so imported icons NEVER disappear if the old folder is moved or deleted.
+  String? _importIconAsset(String? raw, String sourceBaseDir) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    final cleaned = raw.replaceAll('"', '').trim();
+    if (cleaned.isEmpty) return null;
+
+    final baseName = p.basename(cleaned);
+    final candidates = <String>[
+      fromPortablePath(cleaned),
+      cleaned,
+      p.join(sourceBaseDir, cleaned),
+      p.join(sourceBaseDir, 'Icons', cleaned),
+      p.join(sourceBaseDir, 'Icons', baseName),
+      p.join(sourceBaseDir, 'Icons', 'cache', baseName),
+      p.join(iconsDir.path, baseName),
+      p.join(iconsDir.path, 'imported', baseName),
+      p.join(iconsCacheDir.path, baseName),
+      p.join(r'C:\Program Files (x86)\RocketDock', cleaned),
+      p.join(r'C:\Program Files (x86)\RocketDock\Icons', cleaned),
+      p.join(r'C:\Program Files (x86)\RocketDock\Icons', baseName),
+      p.join(r'C:\Program Files\RocketDock', cleaned),
+      p.join(r'C:\Program Files\RocketDock\Icons', cleaned),
+      p.join(r'C:\Program Files\RocketDock\Icons', baseName),
+    ];
+
+    File? found;
+    for (final c in candidates) {
+      if (c.isEmpty) continue;
+      try {
+        final f = File(c);
+        if (f.existsSync()) {
+          found = f;
+          break;
+        }
+      } catch (_) {}
+    }
+    if (found == null) return null;
+
+    // Already inside our current portable directory -> keep directly
+    final ownPrefix = '${portableDir.path.toLowerCase()}\\';
+    if (found.path.toLowerCase().startsWith(ownPrefix)) {
+      return found.path;
+    }
+
+    // Copy external icon into our portable Icons/imported or Icons/cache directory
+    try {
+      final isCacheIcon = baseName.toLowerCase().startsWith('hd128_') ||
+          baseName.toLowerCase().startsWith('ico_');
+      final dstDir = isCacheIcon
+          ? iconsCacheDir
+          : Directory(p.join(iconsDir.path, 'imported'));
+      if (!dstDir.existsSync()) dstDir.createSync(recursive: true);
+      final dstFile = File(p.join(dstDir.path, baseName));
+      if (!dstFile.existsSync()) {
+        found.copySync(dstFile.path);
+      }
+      return dstFile.path;
+    } catch (_) {
+      return found.path;
+    }
+  }
+
+  List<DockItemModel> _parseAeroDockItemsSection(
+    int dockId,
+    Map<String, String> itemsSec, {
+    String? sourceBaseDir,
+  }) {
+    final count = _int(itemsSec['Count'], 0);
+    final list = <DockItemModel>[];
+    for (var i = 0; i < count; i++) {
+      final prefix = 'Item$i';
+      final type = itemsSec['$prefix.Type'];
+      if (type == null || type.isEmpty) continue;
+      final rawIcon = _emptyToNull(itemsSec['$prefix.IconPath']);
+      final rawAlt = _emptyToNull(itemsSec['$prefix.IconPathAlt']);
+      final resolvedIcon = sourceBaseDir != null
+          ? _importIconAsset(rawIcon, sourceBaseDir)
+          : (rawIcon != null ? fromPortablePath(rawIcon) : null);
+      final resolvedAlt = sourceBaseDir != null
+          ? _importIconAsset(rawAlt, sourceBaseDir)
+          : (rawAlt != null ? fromPortablePath(rawAlt) : null);
+      list.add(
+        DockItemModel(
+          id: itemsSec['$prefix.Id'] ?? 'd${dockId}_$i',
+          type: type,
+          title: itemsSec['$prefix.Title'] ?? '',
+          target: fromPortablePath(itemsSec['$prefix.Target'] ?? ''),
+          startIn: fromPortablePath(itemsSec['$prefix.StartIn'] ?? ''),
+          args: itemsSec['$prefix.Args'] ?? '',
+          runMode: itemsSec['$prefix.RunMode'] ?? 'normal',
+          openRunning: itemsSec['$prefix.OpenRunning'] ?? 'global',
+          popupMenu: _bool(itemsSec['$prefix.PopupMenu'], true),
+          iconKey: itemsSec['$prefix.IconKey'] ?? 'rocket',
+          color: itemsSec['$prefix.Color'] ?? '#0284C7',
+          iconPath: resolvedIcon,
+          iconPathAlt: resolvedAlt,
+          devRuleId: _emptyToNull(itemsSec['$prefix.DevRuleId']),
+        ),
+      );
+    }
+    return list;
+  }
+
+  /// Import an original RocketDock 1.3.5 Settings.ini (ALL real formats + .reg exports!)
+  /// OR an AeroDock Settings.ini (transfers ALL 4 panels, positions, enabled states, DevRules, and icons!).
   Future<RocketDockImportResult> importRocketDock135Ini(
     File sourceFile, {
     required int targetDockId,
@@ -966,6 +1105,7 @@ class PortableIniStore {
       final bytes = await sourceFile.readAsBytes();
       final text = decodeWindowsIniBytes(bytes);
       final sections = parseIniText(text);
+      final baseDir = sourceFile.parent.path;
 
       // Safety backup before importing
       if (backupSettings.autoBackupEnabled && iniFile.existsSync()) {
@@ -973,96 +1113,171 @@ class PortableIniStore {
       }
 
       // ------------------------------------------------------------------
-      // CASE 1: User selected an AeroDock Settings.ini (e.g., from another folder / backup)!
+      // CASE 1: AeroDock Settings.ini -> Full Multi-Panel Profile Transfer!
+      // Transfers General flags (Dock2/3/Dev enabled), ALL 4 panel positions & styles,
+      // ALL 4 panel icon lists (copying icons into portable Icons/), and DevRules!
       // ------------------------------------------------------------------
       if (isAeroDockIni(sections)) {
-        // If importing into Dock 1 with replace, import ALL docks + DevRules if user wants full profile,
-        // or import the matching Dock section into targetDockId.
-        final srcItemsSec = sections['Dock$targetDockId-Items'] ?? sections['Dock1-Items'];
-        final srcPanelSec = sections['Dock$targetDockId'] ?? sections['Dock1'];
-        final importedList = <DockItemModel>[];
+        // Also copy any custom icons from sourceFolder/Icons if present
+        try {
+          final srcIconsDir = Directory(p.join(baseDir, 'Icons'));
+          if (srcIconsDir.existsSync() &&
+              srcIconsDir.path.toLowerCase() != iconsDir.path.toLowerCase()) {
+            await _copyDirFiles(srcIconsDir, iconsDir);
+          }
+        } catch (_) {}
 
-        if (srcItemsSec != null) {
-          final count = _int(srcItemsSec['Count'], 0);
-          for (var i = 0; i < count; i++) {
-            final prefix = 'Item$i';
-            final type = srcItemsSec['$prefix.Type'];
-            if (type == null || type.isEmpty) continue;
-            final rawIcon = _emptyToNull(srcItemsSec['$prefix.IconPath']);
-            final rawAlt = _emptyToNull(srcItemsSec['$prefix.IconPathAlt']);
-            importedList.add(
-              DockItemModel(
-                id: 'imp_${DateTime.now().millisecondsSinceEpoch}_$i',
-                type: type,
-                title: srcItemsSec['$prefix.Title'] ?? '',
-                target: srcItemsSec['$prefix.Target'] ?? '',
-                startIn: srcItemsSec['$prefix.StartIn'] ?? '',
-                args: srcItemsSec['$prefix.Args'] ?? '',
-                runMode: srcItemsSec['$prefix.RunMode'] ?? 'normal',
-                openRunning: srcItemsSec['$prefix.OpenRunning'] ?? 'global',
-                popupMenu: _bool(srcItemsSec['$prefix.PopupMenu'], true),
-                iconKey: srcItemsSec['$prefix.IconKey'] ?? 'rocket',
-                color: srcItemsSec['$prefix.Color'] ?? '#0284C7',
-                iconPath: rawIcon != null ? fromPortablePath(rawIcon) : null,
-                iconPathAlt: rawAlt != null ? fromPortablePath(rawAlt) : null,
-                devRuleId: _emptyToNull(srcItemsSec['$prefix.DevRuleId']),
-              ),
-            );
+        final g = sections['General'];
+        if (g != null && importVisualSettings) {
+          final legacyDockCount = _int(g['DockCount'], 1);
+          global = GlobalDockSettings(
+            language: g['Language'] ?? global.language,
+            launchWithWindows: global.launchWithWindows,
+            portableIni: _bool(g['PortableIni'], global.portableIni),
+            minimizeToDock: _bool(g['MinimizeToDock'], global.minimizeToDock),
+            disableMinimizeAnimation:
+                _bool(g['DisableMinimizeAnimation'], global.disableMinimizeAnimation),
+            showRunningIndicators:
+                _bool(g['ShowRunningIndicators'], global.showRunningIndicators),
+            openRunningInstance:
+                _bool(g['OpenRunningInstance'], global.openRunningInstance),
+            lockItems: _bool(g['LockItems'], global.lockItems),
+            dock2Enabled: g.containsKey('Dock2Enabled')
+                ? _bool(g['Dock2Enabled'], global.dock2Enabled)
+                : legacyDockCount >= 2,
+            dock3Enabled: g.containsKey('Dock3Enabled')
+                ? _bool(g['Dock3Enabled'], global.dock3Enabled)
+                : legacyDockCount >= 3,
+            devDockEnabled: _bool(g['DevDockEnabled'], global.devDockEnabled),
+            excludedWindows: _list(g['ExcludedWindows']),
+            iconFolders: _list(g['IconFolders']).map(fromPortablePath).toList(),
+          );
+        }
+
+        // Import DevDock & DevRules if present
+        final devSec = sections['DevDock'];
+        final rulesSec = sections['DevRules'];
+        if (devSec != null || rulesSec != null) {
+          final devDef = DevDockSettings.defaults(portableDir);
+          final loadedRules = <DevAppRule>[];
+          if (rulesSec != null) {
+            final ruleCount = _int(rulesSec['Count'], 0);
+            for (var i = 0; i < ruleCount; i++) {
+              final pre = 'Rule$i';
+              final prefix = rulesSec['$pre.Prefix'] ?? '';
+              if (prefix.isEmpty) continue;
+              loadedRules.add(
+                DevAppRule(
+                  id: rulesSec['$pre.Id'] ?? 'rule_$i',
+                  name: rulesSec['$pre.Name'] ?? prefix,
+                  archivePrefix: prefix,
+                  exeHint: rulesSec['$pre.ExeHint'] ?? '',
+                  preservePatterns: rulesSec['$pre.PreservePatterns'] ?? '',
+                  preserveSettings: _bool(rulesSec['$pre.PreserveSettings'], true),
+                  keepBackup: _bool(rulesSec['$pre.KeepBackup'], true),
+                  lastArchiveName: rulesSec['$pre.LastArchive'] ?? '',
+                  lastUpdated: rulesSec['$pre.LastUpdated'] ?? '',
+                  versionCount: _int(rulesSec['$pre.VersionCount'], 0),
+                ),
+              );
+            }
+          }
+          devSettings = DevDockSettings(
+            watchFolder: (devSec?['WatchFolder'] ?? '').isNotEmpty
+                ? fromPortablePath(devSec!['WatchFolder']!)
+                : devDef.watchFolder,
+            appsRootFolder: (devSec?['AppsRootFolder'] ?? '').isNotEmpty
+                ? fromPortablePath(devSec!['AppsRootFolder']!)
+                : devDef.appsRootFolder,
+            maxBackupsPerApp: _int(devSec?['MaxBackupsPerApp'], devSettings.maxBackupsPerApp).clamp(1, 30),
+            defaultPreserveExts: (devSec?['DefaultPreserveExts'] ?? '').isNotEmpty
+                ? devSec!['DefaultPreserveExts']!
+                : devDef.defaultPreserveExts,
+            moveArchiveToStorage:
+                _bool(devSec?['MoveArchiveToStorage'], devSettings.moveArchiveToStorage),
+            rules: loadedRules.isNotEmpty ? loadedRules : devSettings.rules,
+            processedSignatures: _list(devSec?['ProcessedSignatures']),
+          );
+        }
+
+        var importedPanelsCount = 0;
+        var importedItemsTotal = 0;
+        for (var id = 1; id <= 4; id++) {
+          final pSec = sections['Dock$id'];
+          if (pSec != null) {
+            importedPanelsCount++;
+            if (importVisualSettings) {
+              panels[id] = _parsePanelSection(id, pSec);
+            }
+          }
+
+          final iSec = sections['Dock$id-Items'];
+          if (iSec != null) {
+            final parsedItems = _parseAeroDockItemsSection(id, iSec, sourceBaseDir: baseDir);
+            importedItemsTotal += parsedItems.length;
+            if (replaceExistingItems) {
+              dockItems[id] = parsedItems;
+            } else {
+              dockItems.putIfAbsent(id, () => []).addAll(parsedItems);
+            }
           }
         }
 
-        if (importVisualSettings && srcPanelSec != null) {
-          panels[targetDockId] = _parsePanelSection(targetDockId, srcPanelSec);
-        }
-        if (importedList.isNotEmpty) {
-          if (replaceExistingItems) {
-            dockItems[targetDockId] = importedList;
-          } else {
-            dockItems.putIfAbsent(targetDockId, () => []).addAll(importedList);
-          }
-        }
         await save();
         return RocketDockImportResult(
           ok: true,
-          importedItems: importedList.length,
-          importedSettings: importVisualSettings && srcPanelSec != null,
-          message: 'Импортирован Settings.ini AeroDock: ${importedList.length} значков в Панель $targetDockId.',
+          importedItems: importedItemsTotal,
+          importedSettings: importVisualSettings && importedPanelsCount > 0,
+          message:
+              'Профиль AeroDock перенесён: $importedPanelsCount панелей, $importedItemsTotal значков, расположение и иконки сохранены!',
         );
       }
 
       // ------------------------------------------------------------------
-      // CASE 2: Original RocketDock 1.3.5 (and ObjectDock/RK/Y'z Dock) Settings.ini
-      // Real RocketDock 1.3.5 stores BOTH settings AND `0-Title`/`0-Command`/`0-FileName`
-      // inside [RocketDock], OR in [RocketDock\Icons] / [Software\RocketDock\Icons] / [Icons] / [Icon0..N]!
+      // CASE 2: Original RocketDock 1.3.5 (and ObjectDock/RK/Y'z Dock / .reg export)
+      // Real RocketDock 1.3.5 stores settings in [RocketDock] / [Software\RocketDock] /
+      // [HKEY_CURRENT_USER\Software\RocketDock], and icons either in the same section OR in
+      // [RocketDock\Icons] / [Software\RocketDock\Icons] / [Icons] / [Icon0..N] / [Icons\0..N]!
       // ------------------------------------------------------------------
       Map<String, String>? rdMain;
       final rdIconMaps = <Map<String, String>>[];
       final perIconSections = <Map<String, String>>[];
 
+      bool hasIndexedIconKeys(Map<String, String> map) {
+        return map.keys.any((k) {
+          final dash = k.indexOf('-');
+          if (dash > 0 && int.tryParse(k.substring(0, dash)) != null) return true;
+          final m = RegExp(r'^(title|command|target|filename|icon|isseparator)(\d+)$',
+                  caseSensitive: false)
+              .firstMatch(k);
+          return m != null;
+        });
+      }
+
       for (final entry in sections.entries) {
         final lower = entry.key.toLowerCase();
         final map = entry.value;
-        final hasIndexedKeys = map.keys.any((k) {
-          final dash = k.indexOf('-');
-          return dash > 0 && int.tryParse(k.substring(0, dash)) != null;
-        });
+        final indexed = hasIndexedIconKeys(map);
 
         if (lower == 'rocketdock' ||
             lower == 'rocketdock-settings' ||
             lower == r'software\rocketdock' ||
+            lower.endsWith(r'\software\rocketdock') ||
             lower == 'settings' ||
             lower == 'dock') {
           rdMain ??= map;
-          if (hasIndexedKeys) rdIconMaps.add(map);
+          if (indexed) rdIconMaps.add(map);
         } else if (lower == r'rocketdock\icons' ||
             lower == r'software\rocketdock\icons' ||
+            lower.endsWith(r'\software\rocketdock\icons') ||
             lower == 'rocketdock-icons' ||
             lower == 'icons' ||
             lower.endsWith(r'\icons')) {
           rdIconMaps.add(map);
-        } else if (RegExp(r'^(rocketdock[-_\\]?icon|icon|item)\d+$').hasMatch(lower)) {
+        } else if (RegExp(r'(^|\\)(rocketdock[-_\\]?icon|icon|item)\d+$').hasMatch(lower) ||
+            RegExp(r'\\icons\\\d+$').hasMatch(lower)) {
           perIconSections.add(map);
-        } else if (hasIndexedKeys) {
+        } else if (indexed) {
           rdIconMaps.add(map);
         }
       }
@@ -1072,11 +1287,11 @@ class PortableIniStore {
           ok: false,
           importedItems: 0,
           importedSettings: false,
-          message: 'Не удалось распознать формат INI (проверьте, что файл содержит секции [RocketDock], [Icons] или [Dock1]).',
+          message:
+              'Не удалось распознать формат INI (проверьте, что файл содержит секции [RocketDock], [Software\\RocketDock], [Icons] или [Dock1]).',
         );
       }
 
-      final baseDir = sourceFile.parent.path;
       final panel = panels[targetDockId] ?? DockPanelConfig.defaultFor(targetDockId);
       var settingsImported = false;
 
@@ -1109,6 +1324,11 @@ class PortableIniStore {
           }
         }
 
+        final iconOp = double.tryParse(getCI('IconOpacity') ?? '');
+        if (iconOp != null) {
+          panel.iconOpacity = (iconOp > 100 ? (iconOp / 255.0) * 100.0 : iconOp).clamp(20, 100);
+        }
+
         final zoomWidth = double.tryParse(getCI('ZoomWidth') ?? '');
         if (zoomWidth != null) panel.zoomWidth = zoomWidth.clamp(1.0, 6.0);
 
@@ -1122,6 +1342,11 @@ class PortableIniStore {
             '2' => 'bottom',
             _ => 'normal',
           };
+        }
+
+        final hOff = double.tryParse(getCI('HOffset') ?? getCI('CenterOffset') ?? '');
+        if (hOff != null) {
+          panel.centerOffset = (hOff.abs() > 40 ? (hOff / 20.0) : hOff).clamp(-40, 40);
         }
 
         final edgeOff = double.tryParse(getCI('EdgeOffset') ?? getCI('VOffset') ?? '');
@@ -1178,6 +1403,13 @@ class PortableIniStore {
         final themeName = getCI('Theme');
         if (themeName != null && themeName.isNotEmpty) {
           final localSkin = Directory(p.join(skinsDir.path, themeName));
+          if (!localSkin.existsSync()) {
+            // Try copying matching skin from source RocketDock/Skins/<Theme>
+            final srcSkin = Directory(p.join(baseDir, 'Skins', themeName));
+            if (srcSkin.existsSync()) {
+              await _copyDirFiles(srcSkin, localSkin);
+            }
+          }
           if (localSkin.existsSync()) {
             panel.theme = 'skin:$themeName';
           }
@@ -1185,19 +1417,6 @@ class PortableIniStore {
 
         panels[targetDockId] = panel;
         settingsImported = true;
-      }
-
-      String? resolveRdIconPath(String? raw) {
-        if (raw == null || raw.trim().isEmpty) return null;
-        final cleaned = raw.replaceAll('"', '').trim();
-        if (File(cleaned).existsSync()) return cleaned;
-        final relToSource = p.join(baseDir, cleaned);
-        if (File(relToSource).existsSync()) return relToSource;
-        final relToSourceIcons = p.join(baseDir, 'Icons', cleaned);
-        if (File(relToSourceIcons).existsSync()) return relToSourceIcons;
-        final relToIcons = p.join(iconsDir.path, p.basename(cleaned));
-        if (File(relToIcons).existsSync()) return relToIcons;
-        return null;
       }
 
       DockItemModel buildRdItem({
@@ -1222,7 +1441,9 @@ class PortableIniStore {
 
         if (isSep || rdType == '1' || cmdLower == '[separator]') {
           type = 'separator';
-        } else if (cmdLower == '[settings]' || cmdLower.contains('dock settings') || rdType == '3' && cmdLower.isEmpty) {
+        } else if (cmdLower == '[settings]' ||
+            cmdLower.contains('dock settings') ||
+            (rdType == '3' && cmdLower.isEmpty)) {
           type = 'dock_settings';
           iconKey = 'settings';
           color = '#475569';
@@ -1237,6 +1458,12 @@ class PortableIniStore {
           resolvedTarget = 'shell:RecycleBinFolder';
           iconKey = 'trash';
           color = '#64748B';
+        } else if (cmdLower.contains('20d04fe0-3aea-1069-a2d8-08002b30309d')) {
+          type = 'file';
+          resolvedTarget = 'explorer.exe';
+          args = args.isEmpty ? 'shell:MyComputerFolder' : args;
+          iconKey = 'folder-blue';
+          color = '#2563EB';
         } else if (cmdLower.contains('clock')) {
           type = 'docklet_clock';
           iconKey = 'clock';
@@ -1278,29 +1505,41 @@ class PortableIniStore {
           popupMenu: useCtx,
           iconKey: iconKey,
           color: color,
-          iconPath: resolveRdIconPath(fileName),
-          iconPathAlt: resolveRdIconPath(fileName2),
+          iconPath: _importIconAsset(fileName, baseDir),
+          iconPathAlt: _importIconAsset(fileName2, baseDir),
         );
       }
 
       final importedList = <DockItemModel>[];
 
-      // Parse indexed icon keys (`0-Title`, `0-Command`, `0-FileName`, `0-Type`, ...)
+      // Parse indexed icon keys (`0-Title`/`0-Command`/`0-FileName` AND `Title0`/`Command0`/`FileName0`)
       for (final rdIcons in rdIconMaps) {
         final indices = <int>{};
         for (final key in rdIcons.keys) {
           final dash = key.indexOf('-');
           if (dash > 0) {
             final idx = int.tryParse(key.substring(0, dash));
+            if (idx != null) {
+              indices.add(idx);
+              continue;
+            }
+          }
+          final m = RegExp(r'^(?:title|command|target|filename|icon|isseparator)(\d+)$',
+                  caseSensitive: false)
+              .firstMatch(key);
+          if (m != null) {
+            final idx = int.tryParse(m.group(1)!);
             if (idx != null) indices.add(idx);
           }
         }
         final sorted = indices.toList()..sort();
 
         String? iconVal(int i, String field) {
-          final wanted = '$i-${field.toLowerCase()}';
+          final wantedDash = '$i-${field.toLowerCase()}';
+          final wantedSuffix = '${field.toLowerCase()}$i';
           for (final e in rdIcons.entries) {
-            if (e.key.toLowerCase() == wanted) return e.value;
+            final kl = e.key.toLowerCase();
+            if (kl == wantedDash || kl == wantedSuffix) return e.value;
           }
           return null;
         }
@@ -1311,9 +1550,9 @@ class PortableIniStore {
               idx: idx,
               isSep: iconVal(idx, 'IsSeparator') == '1',
               rdType: iconVal(idx, 'Type') ?? '0',
-              title: iconVal(idx, 'Title') ?? '',
-              cmd: iconVal(idx, 'Command') ?? iconVal(idx, 'Target') ?? '',
-              args: iconVal(idx, 'Arguments') ?? '',
+              title: iconVal(idx, 'Title') ?? iconVal(idx, 'Name') ?? '',
+              cmd: iconVal(idx, 'Command') ?? iconVal(idx, 'Target') ?? iconVal(idx, 'Link') ?? '',
+              args: iconVal(idx, 'Arguments') ?? iconVal(idx, 'Args') ?? '',
               workDir: iconVal(idx, 'WorkingDirectory') ?? iconVal(idx, 'StartIn') ?? '',
               fileName: iconVal(idx, 'FileName') ?? iconVal(idx, 'Icon') ?? iconVal(idx, 'Image'),
               fileName2: iconVal(idx, 'FileName2'),
@@ -1325,7 +1564,7 @@ class PortableIniStore {
         }
       }
 
-      // Also parse per-icon sections (`[Icon0]`, `[Item0]`, etc.) if present
+      // Also parse per-icon sections (`[Icon0]`, `[Item0]`, `[Software\RocketDock\Icons\0]`, etc.)
       for (var i = 0; i < perIconSections.length; i++) {
         final sec = perIconSections[i];
         String? val(String field) {
@@ -1361,6 +1600,9 @@ class PortableIniStore {
           dockItems.putIfAbsent(targetDockId, () => []).addAll(importedList);
         }
       }
+      if (targetDockId == 2) global.dock2Enabled = true;
+      if (targetDockId == 3) global.dock3Enabled = true;
+      if (targetDockId == 4) global.devDockEnabled = true;
 
       await save();
       return RocketDockImportResult(
@@ -1443,6 +1685,7 @@ class PortableIniStore {
     }
 
     final g = sections['General'] ?? {};
+    _revision = _int(g['Revision'], _revision);
     final legacyDockCount = _int(g['DockCount'], 1);
     global = GlobalDockSettings(
       language: g['Language'] ?? 'ru',
@@ -1528,44 +1771,68 @@ class PortableIniStore {
 
       final itemsSec = sections['Dock$id-Items'];
       if (itemsSec != null) {
-        final count = _int(itemsSec['Count'], 0);
-        final list = <DockItemModel>[];
-        for (var i = 0; i < count; i++) {
-          final prefix = 'Item$i';
-          final type = itemsSec['$prefix.Type'];
-          if (type == null || type.isEmpty) continue;
-          final rawIcon = _emptyToNull(itemsSec['$prefix.IconPath']);
-          final rawAlt = _emptyToNull(itemsSec['$prefix.IconPathAlt']);
-          list.add(
-            DockItemModel(
-              id: itemsSec['$prefix.Id'] ?? 'd${id}_$i',
-              type: type,
-              title: itemsSec['$prefix.Title'] ?? '',
-              target: fromPortablePath(itemsSec['$prefix.Target'] ?? ''),
-              startIn: fromPortablePath(itemsSec['$prefix.StartIn'] ?? ''),
-              args: itemsSec['$prefix.Args'] ?? '',
-              runMode: itemsSec['$prefix.RunMode'] ?? 'normal',
-              openRunning: itemsSec['$prefix.OpenRunning'] ?? 'global',
-              popupMenu: _bool(itemsSec['$prefix.PopupMenu'], true),
-              iconKey: itemsSec['$prefix.IconKey'] ?? 'rocket',
-              color: itemsSec['$prefix.Color'] ?? '#0284C7',
-              iconPath: rawIcon != null ? fromPortablePath(rawIcon) : null,
-              iconPathAlt: rawAlt != null ? fromPortablePath(rawAlt) : null,
-              devRuleId: _emptyToNull(itemsSec['$prefix.DevRuleId']),
-            ),
-          );
-        }
-        dockItems[id] = list;
+        dockItems[id] = _parseAeroDockItemsSection(id, itemsSec);
       }
     }
 
-    lastLoadedModified = await iniFile.lastModified();
+    _lastContentSignature = _computeBytesSignature(bytes);
+    try {
+      lastLoadedModified = await iniFile.lastModified();
+    } catch (_) {}
   }
 
-  Future<void> save({bool skipProfileSync = false}) async {
+  /// Safely persist ONLY the items list of [dockId] without overwriting panel positions
+  /// or settings that may have been updated concurrently by the Settings window or another dock!
+  Future<void> saveDockItemsOnly(int dockId, {bool skipProfileSync = false}) async {
+    final myItems = List<DockItemModel>.from(dockItems[dockId] ?? const []);
+    await reloadFromDisk();
+    dockItems[dockId] = myItems;
+    await save(skipProfileSync: skipProfileSync);
+  }
+
+  /// Safely persist ONLY the panel configuration of [dockId] without clobbering sibling docks!
+  Future<void> savePanelConfigOnly(int dockId, {bool skipProfileSync = false}) async {
+    final myCfg = panels[dockId]?.copy();
+    if (myCfg == null) return;
+    await reloadFromDisk();
+    panels[dockId] = myCfg;
+    await save(skipProfileSync: skipProfileSync);
+  }
+
+  /// Safely mutate a global flag on top of the latest disk Settings.ini without clobbering panels!
+  Future<void> saveGlobalChange(
+    void Function(GlobalDockSettings g) mutate, {
+    bool skipProfileSync = false,
+  }) async {
+    await reloadFromDisk();
+    mutate(global);
+    await save(skipProfileSync: skipProfileSync);
+  }
+
+  Future<void> save({bool skipProfileSync = false, bool preserveDiskItems = false}) async {
+    // When saving from the Settings window, preserve any icons added/reordered on docks in parallel
+    if (preserveDiskItems && await iniFile.exists()) {
+      try {
+        final diskBytes = await iniFile.readAsBytes();
+        if (diskBytes.isNotEmpty) {
+          final diskSections = parseIniText(decodeWindowsIniBytes(diskBytes));
+          final diskRev = _int(diskSections['General']?['Revision'], 0);
+          if (diskRev > _revision) _revision = diskRev;
+          for (var id = 1; id <= 4; id++) {
+            final iSec = diskSections['Dock$id-Items'];
+            if (iSec != null) {
+              dockItems[id] = _parseAeroDockItemsSection(id, iSec);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    _revision++;
     final sb = StringBuffer()
       ..writeln('; AeroDock Portable v3.6 — Settings.ini (UTF-8, RocketDock 1.3.5 Import + Live Preview + Auto-Backup)')
       ..writeln('[General]')
+      ..writeln('Revision=$_revision')
       ..writeln('Language=${global.language}')
       ..writeln('LaunchWithWindows=${global.launchWithWindows ? 1 : 0}')
       ..writeln('PortableIni=${global.portableIni ? 1 : 0}')
@@ -1681,18 +1948,42 @@ class PortableIniStore {
       sb.writeln('');
     }
 
-    final content = sb.toString();
-    for (var attempt = 0; attempt < 4; attempt++) {
+    final bytes = utf8.encode(sb.toString());
+    final tmpFile = File('${iniFile.path}.tmp.$pid.${DateTime.now().microsecondsSinceEpoch}');
+    var written = false;
+
+    for (var attempt = 0; attempt < 5; attempt++) {
       try {
-        await iniFile.writeAsString(content, flush: true);
-        lastLoadedModified = await iniFile.lastModified();
+        await tmpFile.writeAsBytes(bytes, flush: true);
+        try {
+          await tmpFile.rename(iniFile.path);
+        } catch (_) {
+          // On Windows, rename over an open/locked file can fail; fall back to direct atomic-ish copy
+          await iniFile.writeAsBytes(bytes, flush: true);
+          if (tmpFile.existsSync()) {
+            try {
+              tmpFile.deleteSync();
+            } catch (_) {}
+          }
+        }
+        _lastContentSignature = _computeBytesSignature(bytes);
+        try {
+          lastLoadedModified = await iniFile.lastModified();
+        } catch (_) {}
+        written = true;
         break;
       } catch (_) {
-        if (attempt < 3) {
-          await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (attempt < 4) {
+          await Future<void>.delayed(const Duration(milliseconds: 55));
         }
       }
     }
+    if (!written && tmpFile.existsSync()) {
+      try {
+        tmpFile.deleteSync();
+      } catch (_) {}
+    }
+
     if (!skipProfileSync) {
       await _syncToUserProfile();
     }
