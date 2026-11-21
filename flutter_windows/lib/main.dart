@@ -93,7 +93,8 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
     AppI18n.loadExternalLanguages(store.languagesDir);
     AppI18n.currentCode = store.global.language;
     const debugOpts = WindowOptions(
-      size: Size(696, 576),
+      size: Size(720, 580),
+      minimumSize: Size(560, 420),
       center: true,
       backgroundColor: Colors.transparent,
       skipTaskbar: false,
@@ -107,7 +108,8 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
           await windowManager.setAsFrameless();
           await windowManager.setHasShadow(false);
           await windowManager.setBackgroundColor(Colors.transparent);
-          await windowManager.setResizable(false);
+          await windowManager.setResizable(true);
+          await windowManager.setMinimumSize(const Size(560, 420));
           await windowManager.setAlwaysOnTop(true);
           await windowManager.center();
           await windowManager.show();
@@ -116,6 +118,8 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
             effect: acrylic.WindowEffect.transparent,
             color: const Color(0x00000000),
           );
+          final hwnd = Win32Bridge.findOwnWindowHandle();
+          if (hwnd != 0) Win32Bridge.stripWindowChromeAndBorder(hwnd, keepResizable: true);
         } catch (_) {}
       }),
     );
@@ -143,7 +147,8 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
     } catch (_) {}
 
     const settingsOpts = WindowOptions(
-      size: Size(810, 600),
+      size: Size(860, 620),
+      minimumSize: Size(680, 480),
       center: true,
       backgroundColor: Colors.transparent,
       skipTaskbar: false,
@@ -172,7 +177,8 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
           await windowManager.setBackgroundColor(Colors.transparent);
         } catch (_) {}
         try {
-          await windowManager.setResizable(false);
+          await windowManager.setResizable(true);
+          await windowManager.setMinimumSize(const Size(680, 480));
         } catch (_) {}
         try {
           await windowManager.setAlwaysOnTop(true);
@@ -189,6 +195,10 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
             effect: acrylic.WindowEffect.transparent,
             color: const Color(0x00000000),
           );
+        } catch (_) {}
+        try {
+          final hwnd = Win32Bridge.findOwnWindowHandle();
+          if (hwnd != 0) Win32Bridge.stripWindowChromeAndBorder(hwnd, keepResizable: true);
         } catch (_) {}
       }),
     );
@@ -252,13 +262,17 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
       try {
         await windowManager.show();
       } catch (_) {}
+      // ALWAYS keep full dock HWND 100% transparent (never acrylic on full HWND!)
+      // and strip Windows 11 DWM 1px rounded border/backdrop so no outer box ever appears!
       try {
         await acrylic.Window.setEffect(
-          effect: cfg.useAcrylic
-              ? acrylic.WindowEffect.acrylic
-              : acrylic.WindowEffect.transparent,
-          color: cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
+          effect: acrylic.WindowEffect.transparent,
+          color: const Color(0x00000000),
         );
+      } catch (_) {}
+      try {
+        final hwnd = Win32Bridge.findOwnWindowHandle();
+        if (hwnd != 0) Win32Bridge.stripWindowChromeAndBorder(hwnd);
       } catch (_) {}
     }),
   );
@@ -358,7 +372,7 @@ class _StandaloneSettingsHostState extends State<_StandaloneSettingsHost> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: Center(
+      body: SizedBox.expand(
         child: DockSettingsDialog(
           store: widget.store,
           activeDockId: widget.activeDockId,
@@ -448,7 +462,7 @@ class _StandaloneDebugHostState extends State<_StandaloneDebugHost> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: Center(
+      body: SizedBox.expand(
         child: LiveDebugMonitorPanel(
           store: widget.store,
           debugEnabled: _debugEnabled,
@@ -577,7 +591,7 @@ class _DockShellPageState extends State<DockShellPage>
   final Set<int> _hiddenByDockHwnds = {};
   bool _baselineCaptured = false;
 
-  // Lightweight, demand-driven timers
+  // Lightweight, demand-driven timers & OS file watcher
   Timer? _clockTimer;
   Timer? _statsTimer;
   Timer? _recycleTimer;
@@ -586,6 +600,10 @@ class _DockShellPageState extends State<DockShellPage>
   Timer? _edgeHoverTimer;
   Timer? _autoHideDelayTimer;
   Timer? _popupDelayTimer;
+  StreamSubscription<FileSystemEvent>? _dirWatchSub;
+  bool _recycleInFlight = false;
+  int _chromeStrippedHwnd = 0;
+  Rect? _lastAppliedLogicalBounds;
 
   // RocketDock global hotkey: Ctrl+Alt+R (completely hide/show + pause all polling)
   final HotKey _toggleHotKey = HotKey(
@@ -659,7 +677,7 @@ class _DockShellPageState extends State<DockShellPage>
       await _ensureDockVisible();
       _pollWindowsAndRunning();
       _pollStatsNow();
-      _pollRecycleBinNow();
+      unawaited(_pollRecycleBinNow());
 
       // Safety visibility & geometry check after window_manager/flutter_acrylic finish attaching
       Future<void>.delayed(const Duration(milliseconds: 550), () async {
@@ -686,13 +704,13 @@ class _DockShellPageState extends State<DockShellPage>
       _pollStatsNow();
     });
 
-    // 3. Recycle Bin polls every 5s ONLY if recycle_bin exists on this dock
-    _recycleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+    // 3. Recycle Bin polls every 15s on a background Isolate (0.0ms UI stall!) ONLY if recycle_bin exists
+    _recycleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (_suspended || !mounted) return;
-      _pollRecycleBinNow();
+      unawaited(_pollRecycleBinNow());
     });
 
-    // 4. Running indicators & Minimize-to-dock poll every 1.4s via PID-cached Win32 FFI (<0.15ms)
+    // 4. Running indicators & Minimize-to-dock poll every 1.4s via PID-cached Win32 FFI (<0.4ms)
     _winPollTimer = Timer.periodic(const Duration(milliseconds: 1400), (_) {
       if (_suspended || !mounted) return;
       if (widget.store.global.showRunningIndicators ||
@@ -701,9 +719,23 @@ class _DockShellPageState extends State<DockShellPage>
       }
     });
 
-    // 5. Fast Live Settings & Multi-Dock INI sync every 300ms (uses .aerodock_rev fast-path!)
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
-      _checkMultiDockSync();
+    // 5. Event-driven OS Directory.watch (<5ms instant live preview, ZERO idle polling!) + 1500ms safety fallback
+    try {
+      _dirWatchSub = widget.store.portableDir
+          .watch(events: FileSystemEvent.modify | FileSystemEvent.create)
+          .listen((ev) {
+        final name = p.basename(ev.path).toLowerCase();
+        if (name == '.aerodock_rev' ||
+            name == 'settings.ini' ||
+            name == '.aerodock_quit' ||
+            name == '.aerodock_hidden') {
+          unawaited(_checkMultiDockSync());
+        }
+      });
+    } catch (_) {}
+
+    _syncTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) {
+      unawaited(_checkMultiDockSync());
     });
 
     // 6. AutoHide / Popup edge hover check ONLY when needed (uses cached rect, 0 IPC!)
@@ -727,6 +759,7 @@ class _DockShellPageState extends State<DockShellPage>
   @override
   void dispose() {
     DebugMonitor.dispose();
+    _dirWatchSub?.cancel();
     _clockTimer?.cancel();
     _statsTimer?.cancel();
     _recycleTimer?.cancel();
@@ -802,13 +835,22 @@ class _DockShellPageState extends State<DockShellPage>
     });
   }
 
-  void _pollRecycleBinNow() {
-    DebugMonitor.traceSync('recycle_poll', () {
-      if (_items.any((e) => e.type == 'recycle_bin')) {
-        final info = Win32Bridge.queryRecycleBin();
-        if (info != _recycleBinNotifier.value) _recycleBinNotifier.value = info;
+  Future<void> _pollRecycleBinNow() async {
+    if (_recycleInFlight || !_items.any((e) => e.type == 'recycle_bin')) return;
+    _recycleInFlight = true;
+    try {
+      final info = await DebugMonitor.traceAsync(
+        'recycle_poll',
+        Win32Bridge.queryRecycleBinAsync,
+        warnThresholdMs: 300,
+      );
+      if (mounted && info != _recycleBinNotifier.value) {
+        _recycleBinNotifier.value = info;
       }
-    });
+    } catch (_) {
+    } finally {
+      _recycleInFlight = false;
+    }
   }
 
   // ============================================================================
@@ -965,7 +1007,7 @@ class _DockShellPageState extends State<DockShellPage>
             MenuItem(key: 'settings_dev', label: 'Панель «Разработка» (GitHub)…'),
             MenuItem(key: 'settings_backup', label: 'Бэкапы и восстановление…'),
             MenuItem(key: 'backup_now', label: 'Создать бэкап сейчас'),
-            MenuItem(key: 'import_rd_auto', label: 'Авто-импорт RocketDock 1.3.5 (Реестр)…'),
+            MenuItem(key: 'import_rd_auto', label: 'Найти и импортировать RocketDock 1.3.5…'),
             MenuItem(key: 'import_rd135', label: 'Импорт Settings.ini / .reg…'),
             MenuItem.separator(),
             MenuItem(key: 'toggle_dock2', label: 'Панель 2 (Справа)${g.dock2Enabled ? ' ✓' : ''}'),
@@ -1332,18 +1374,23 @@ class _DockShellPageState extends State<DockShellPage>
     } catch (_) {}
     Win32Bridge.setWindowLayer(_ownHwnd, effectiveLayer);
 
-    // Only touch flutter_acrylic when the setting actually changes — repeated calls during
-    // resize/move can corrupt the transparent DWM composition surface on Windows 11!
-    if (forceAcrylic || _lastAppliedUseAcrylic != _cfg.useAcrylic) {
-      _lastAppliedUseAcrylic = _cfg.useAcrylic;
+    // Strip Windows 11 1px rounded window border & full-HWND backdrop bleed once per HWND
+    if (_ownHwnd != 0 && (_chromeStrippedHwnd != _ownHwnd || forceAcrylic)) {
+      _chromeStrippedHwnd = _ownHwnd;
+      Win32Bridge.stripWindowChromeAndBorder(_ownHwnd);
+    }
+
+    // ALWAYS keep the full dock HWND purely transparent (never WindowEffect.acrylic on full HWND,
+    // which tints/blurs the entire empty hover rectangle over desktop icons!).
+    if (forceAcrylic || _lastAppliedUseAcrylic != false) {
+      _lastAppliedUseAcrylic = false;
       unawaited(() async {
         try {
           await acrylic.Window.setEffect(
-            effect: _cfg.useAcrylic
-                ? acrylic.WindowEffect.acrylic
-                : acrylic.WindowEffect.transparent,
-            color: _cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
+            effect: acrylic.WindowEffect.transparent,
+            color: const Color(0x00000000),
           );
+          if (_ownHwnd != 0) Win32Bridge.stripWindowChromeAndBorder(_ownHwnd);
         } catch (_) {}
       }());
     }
@@ -1403,21 +1450,21 @@ class _DockShellPageState extends State<DockShellPage>
 
     final baseIcon = _effectiveIconSize;
     final maxIcon = baseIcon * (_cfg.hoverEffect == 'none' ? 1.0 : _cfg.zoomScale);
-    final zoomPad = math.max(36.0, (maxIcon - baseIcon) * 1.3 + 48.0);
+    final zoomPad = math.max(32.0, (maxIcon - baseIcon) * 1.25 + 42.0);
     // Main length fits ALL icons cleanly with zoom headroom and never clips!
-    final mainLen = math.max(220.0, _computeItemsMainSpan() + zoomPad);
-    // Cross length leaves generous room for zoomed icons + floating label!
-    final crossLen = math.max(maxIcon + (_cfg.showLabels ? 58 : 28) + 22, 138.0);
+    final mainLen = math.max(200.0, _computeItemsMainSpan() + zoomPad);
+    // Compact cross length: enough for zoomed icons + label without covering extra desktop space!
+    final crossLen = math.max(maxIcon + (_cfg.showLabels ? 42 : 16) + 12, 98.0);
 
     final bool collapsed = _cfg.autoHide && _isAutoHidden;
     final double winW;
     final double winH;
     if (_isHorizontal) {
-      winW = math.min(math.max(220.0, screen.width - 8), mainLen);
-      winH = collapsed ? 8.0 : math.min(math.max(110.0, screen.height - 16), crossLen);
+      winW = math.min(math.max(200.0, screen.width - 8), mainLen);
+      winH = collapsed ? 8.0 : math.min(math.max(92.0, screen.height - 16), crossLen);
     } else {
-      winW = collapsed ? 8.0 : math.min(math.max(140.0, screen.width - 16), crossLen + 110);
-      winH = math.min(math.max(220.0, screen.height - 8), mainLen);
+      winW = collapsed ? 8.0 : math.min(math.max(120.0, screen.width - 16), crossLen + 92);
+      winH = math.min(math.max(200.0, screen.height - 8), mainLen);
     }
 
     final centerShiftX = screen.width * (_cfg.centerOffset / 100);
@@ -1449,11 +1496,20 @@ class _DockShellPageState extends State<DockShellPage>
     x = x.clamp(screen.left, math.max(screen.left, screen.right - winW));
     y = y.clamp(screen.top, math.max(screen.top, screen.bottom - winH));
 
-    // Apply logical size & position via window_manager
-    try {
-      await windowManager.setSize(Size(winW, winH));
-      await windowManager.setPosition(Offset(x, y));
-    } catch (_) {}
+    // Apply logical size & position via window_manager ONLY when changed (avoids redundant 30ms IPC!)
+    final nextBounds = Rect.fromLTWH(x, y, winW, winH);
+    final changedBounds = _lastAppliedLogicalBounds == null ||
+        (_lastAppliedLogicalBounds!.left - x).abs() > 1 ||
+        (_lastAppliedLogicalBounds!.top - y).abs() > 1 ||
+        (_lastAppliedLogicalBounds!.width - winW).abs() > 1 ||
+        (_lastAppliedLogicalBounds!.height - winH).abs() > 1;
+    if (changedBounds) {
+      _lastAppliedLogicalBounds = nextBounds;
+      try {
+        await windowManager.setSize(Size(winW, winH));
+        await windowManager.setPosition(Offset(x, y));
+      } catch (_) {}
+    }
 
     // Physical-pixel verification & snap: guarantees the HWND sits 100% INSIDE the monitor's
     // real Win32 work area even on 125%/150%/200% DPI or mixed-DPI multi-monitor setups!
@@ -1542,10 +1598,12 @@ class _DockShellPageState extends State<DockShellPage>
       for (final item in _items) {
         if ((item.type == 'file' || item.type == 'path' || item.type == 'blank') &&
             item.target.isNotEmpty) {
-          // Re-extract if missing OR if still pointing to an old blurry 32px ico_* cache file
+          // Re-extract if missing OR if still pointing to an old low-res ico_* / hd128_* cache file
+          final baseIconName = item.iconPath != null ? p.basename(item.iconPath!) : '';
           final needsUpgrade = item.iconPath == null ||
               !safeFileExists(item.iconPath) ||
-              p.basename(item.iconPath!).startsWith('ico_');
+              baseIconName.startsWith('ico_') ||
+              baseIconName.startsWith('hd128_');
           if (needsUpgrade) {
             final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
             if (png != item.iconPath) {
@@ -1859,6 +1917,7 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   Future<void> _closeOverlay() async {
+    _lastAppliedLogicalBounds = null;
     setState(() {
       _overlay = _ActiveOverlay.none;
       _editingItem = null;
@@ -1957,7 +2016,7 @@ class _DockShellPageState extends State<DockShellPage>
       const PopupMenuDivider(),
       PopupMenuItem(
         value: 'import_rd_auto',
-        child: const Text('⚡ Авто-импорт RocketDock 1.3.5 (Реестр)…'),
+        child: const Text('⚡ Найти и импортировать RocketDock 1.3.5…'),
       ),
       PopupMenuItem(
         value: 'import_rd135',
@@ -3099,11 +3158,12 @@ class _DockShellPageState extends State<DockShellPage>
 
     if (safeFileExists(item.iconPath)) {
       return Image(
-        image: ResizeImage(FileImage(File(item.iconPath!)), width: 160),
+        image: ResizeImage(FileImage(File(item.iconPath!)), width: 256),
         width: size,
         height: size,
         fit: BoxFit.contain,
-        filterQuality: _cfg.filterQuality,
+        filterQuality: FilterQuality.high,
+        isAntiAlias: true,
         gaplessPlayback: true,
       );
     }

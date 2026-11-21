@@ -994,12 +994,11 @@ class PortableIniStore {
   Future<bool> hasExternalChanges() async {
     try {
       // Fast path #1: tiny 24-byte revision token written by AeroDock on every save()
-      // (avoids reading & hashing the entire Settings.ini across 4 processes every 300ms!)
-      if (_revTokenFile.existsSync()) {
-        final tok = _revTokenFile.readAsStringSync().trim();
+      // 100% async IO — never stalls the Flutter UI thread!
+      if (await _revTokenFile.exists()) {
+        final tok = (await _revTokenFile.readAsString()).trim();
         if (_lastRevToken != null && tok == _lastRevToken) {
-          // Also check stat size/mtime in case user edited Settings.ini manually in Notepad
-          final st = iniFile.statSync();
+          final st = await iniFile.stat();
           if (st.size == _lastIniSize &&
               lastLoadedModified != null &&
               st.modified == lastLoadedModified) {
@@ -1150,32 +1149,54 @@ class PortableIniStore {
     return sections.containsKey('Dock1') || sections.containsKey('Dock1-Items');
   }
 
-  /// Resolve an icon path from an imported INI and copy external icon files into portable Icons/
-  /// so imported icons NEVER disappear if the old folder is moved or deleted.
+  /// Resolve an icon path from an imported INI and copy/convert external icon files into portable Icons/
+  /// so imported icons NEVER disappear AND `.ico`/`.exe`/`.dll`/`.lnk` icons are cleanly rendered as 256px PNGs!
   String? _importIconAsset(String? raw, String sourceBaseDir) {
     if (raw == null || raw.trim().isEmpty) return null;
-    final cleaned = raw.replaceAll('"', '').trim();
+    var cleaned = raw.replaceAll('"', '').trim();
     if (cleaned.isEmpty) return null;
     if (!cleaned.startsWith(_appDirToken) && isNonFileScheme(cleaned)) return null;
 
-    final expanded = fromPortablePath(cleaned);
+    var iconIndex = 0;
+    final commaIdx = cleaned.lastIndexOf(',');
+    if (commaIdx > 2) {
+      final maybeIdx = int.tryParse(cleaned.substring(commaIdx + 1).trim());
+      if (maybeIdx != null) {
+        iconIndex = maybeIdx;
+        cleaned = cleaned.substring(0, commaIdx).trim();
+      }
+    }
+
+    final expanded = _expandWindowsEnvVars(fromPortablePath(cleaned));
     final baseName = p.basename(expanded);
+    final parentOfBase = Directory(sourceBaseDir).parent.path;
+    final grandParentOfBase = Directory(parentOfBase).parent.path;
+
     final candidates = <String>[
       expanded,
       cleaned,
       p.join(sourceBaseDir, cleaned),
       p.join(sourceBaseDir, 'Icons', cleaned),
       p.join(sourceBaseDir, 'Icons', baseName),
+      p.join(sourceBaseDir, 'Defaults', 'DefaultIcons', cleaned),
+      p.join(sourceBaseDir, 'Defaults', 'DefaultIcons', baseName),
       p.join(sourceBaseDir, 'Icons', 'cache', baseName),
+      p.join(parentOfBase, cleaned),
+      p.join(parentOfBase, 'Icons', baseName),
+      p.join(grandParentOfBase, 'App', 'RocketDock', cleaned),
+      p.join(grandParentOfBase, 'App', 'RocketDock', 'Icons', baseName),
+      p.join(grandParentOfBase, 'App', 'RocketDock', 'Defaults', 'DefaultIcons', baseName),
       p.join(iconsDir.path, baseName),
       p.join(iconsDir.path, 'imported', baseName),
       p.join(iconsCacheDir.path, baseName),
       p.join(r'C:\Program Files (x86)\RocketDock', cleaned),
       p.join(r'C:\Program Files (x86)\RocketDock\Icons', cleaned),
       p.join(r'C:\Program Files (x86)\RocketDock\Icons', baseName),
+      p.join(r'C:\Program Files (x86)\RocketDock\Defaults\DefaultIcons', baseName),
       p.join(r'C:\Program Files\RocketDock', cleaned),
       p.join(r'C:\Program Files\RocketDock\Icons', cleaned),
       p.join(r'C:\Program Files\RocketDock\Icons', baseName),
+      p.join(r'C:\Program Files\RocketDock\Defaults\DefaultIcons', baseName),
     ];
 
     File? found;
@@ -1187,15 +1208,23 @@ class PortableIniStore {
     }
     if (found == null) return null;
 
+    // Flutter Image.file CANNOT decode .ico, .exe, .dll, .lnk directly!
+    // Extract a razor-sharp 256x256 PNG into our portable Icons/cache folder instead.
+    final ext = p.extension(found.path).toLowerCase();
+    if (ext == '.ico' || ext == '.exe' || ext == '.dll' || ext == '.lnk') {
+      return Win32Bridge.extractIconToPng(found.path, iconsCacheDir, iconIndex: iconIndex);
+    }
+
     // Already inside our current portable directory -> keep directly
     final ownPrefix = '${portableDir.path.toLowerCase()}\\';
     if (found.path.toLowerCase().startsWith(ownPrefix)) {
       return found.path;
     }
 
-    // Copy external icon into our portable Icons/imported or Icons/cache directory
+    // Copy external PNG/JPG/WEBP icon into our portable Icons/imported directory
     try {
-      final isCacheIcon = baseName.toLowerCase().startsWith('hd128_') ||
+      final isCacheIcon = baseName.toLowerCase().startsWith('hd256_') ||
+          baseName.toLowerCase().startsWith('hd128_') ||
           baseName.toLowerCase().startsWith('ico_');
       final dstDir = isCacheIcon
           ? iconsCacheDir
@@ -1457,12 +1486,15 @@ class PortableIniStore {
             lower == r'software\rocketdock\icons' ||
             lower.endsWith(r'\rocketdock\icons') ||
             lower == 'rocketdock-icons' ||
+            lower == 'rocketdock-items' ||
             lower == 'icons' ||
+            lower == 'items' ||
             lower == 'iconsettings' ||
-            lower.endsWith(r'\icons')) {
+            lower.endsWith(r'\icons') ||
+            lower.endsWith(r'\items')) {
           rdIconMaps.add(map);
         } else if (RegExp(r'(^|\\)(rocketdock[-_\\]?icon|icon|item)\d+$').hasMatch(lower) ||
-            RegExp(r'\\icons\\\d+$').hasMatch(lower) ||
+            RegExp(r'\\(icons|items)\\\d+$').hasMatch(lower) ||
             RegExp(r'^\d+$').hasMatch(lower)) {
           perIconSections.add(map);
         } else if (indexed) {
@@ -1751,10 +1783,10 @@ class PortableIniStore {
               idx: idx,
               isSep: iconVal(idx, 'IsSeparator') == '1',
               rdType: iconVal(idx, 'Type') ?? '0',
-              title: iconVal(idx, 'Title') ?? iconVal(idx, 'Name') ?? '',
-              cmd: iconVal(idx, 'Command') ?? iconVal(idx, 'Target') ?? iconVal(idx, 'Link') ?? '',
+              title: iconVal(idx, 'Title') ?? iconVal(idx, 'Caption') ?? iconVal(idx, 'Name') ?? '',
+              cmd: iconVal(idx, 'Command') ?? iconVal(idx, 'Path') ?? iconVal(idx, 'Target') ?? iconVal(idx, 'Link') ?? '',
               args: iconVal(idx, 'Arguments') ?? iconVal(idx, 'Args') ?? '',
-              workDir: iconVal(idx, 'WorkingDirectory') ?? iconVal(idx, 'StartIn') ?? '',
+              workDir: iconVal(idx, 'WorkingDirectory') ?? iconVal(idx, 'WorkingDir') ?? iconVal(idx, 'StartIn') ?? '',
               fileName: iconVal(idx, 'FileName') ?? iconVal(idx, 'Icon') ?? iconVal(idx, 'Image'),
               fileName2: iconVal(idx, 'FileName2'),
               showCmd: iconVal(idx, 'ShowCmd') ?? '1',
@@ -1765,7 +1797,7 @@ class PortableIniStore {
         }
       }
 
-      // Also parse per-icon sections (`[Icon0]`, `[Item0]`, `[Software\RocketDock\Icons\0]`, etc.)
+      // Also parse per-icon sections (`[Icon0]`, `[Item0]`, `[Software\RocketDock\Icons\0]`, `[Software\RocketDock\Items\1]`, etc.)
       for (var i = 0; i < perIconSections.length; i++) {
         final sec = perIconSections[i];
         String? val(String field) {
@@ -1781,10 +1813,10 @@ class PortableIniStore {
             idx: 1000 + i,
             isSep: val('IsSeparator') == '1',
             rdType: val('Type') ?? '0',
-            title: val('Title') ?? val('Name') ?? '',
-            cmd: val('Command') ?? val('Target') ?? val('Link') ?? '',
+            title: val('Title') ?? val('Caption') ?? val('Name') ?? '',
+            cmd: val('Command') ?? val('Path') ?? val('Target') ?? val('Link') ?? '',
             args: val('Arguments') ?? val('Args') ?? '',
-            workDir: val('WorkingDirectory') ?? val('StartIn') ?? '',
+            workDir: val('WorkingDirectory') ?? val('WorkingDir') ?? val('StartIn') ?? '',
             fileName: val('FileName') ?? val('Icon') ?? val('Image'),
             fileName2: val('FileName2'),
             showCmd: val('ShowCmd') ?? '1',
@@ -1843,16 +1875,105 @@ class PortableIniStore {
     }
   }
 
-  /// Auto-detect and import RocketDock 1.3.5 directly from Windows Registry (`HKCU\Software\RocketDock`)
-  /// OR standard RocketDock installation folders (`C:\Program Files (x86)\RocketDock\Settings.ini`).
+  /// Import directly from ANY portable RocketDock folder (checks Settings.ini, Data\settings\Settings.ini, *.ini/*.reg).
+  Future<RocketDockImportResult> importRocketDockFolder(
+    Directory folder, {
+    required int targetDockId,
+    bool importVisualSettings = true,
+    bool replaceExistingItems = true,
+  }) async {
+    final ini = Win32Bridge.findRocketDockIniInFolder(folder);
+    if (ini == null) {
+      DebugMonitor.log('WARN', 'rd_folder', 'Settings.ini не найден в папке ${folder.path}');
+      return RocketDockImportResult(
+        ok: false,
+        importedItems: 0,
+        importedSettings: false,
+        message:
+            'В папке ${folder.path} не найден файл Settings.ini. В самом RocketDock включите: Настройки → Общие → «Хранить настройки в INI (портативно)», затем повторите импорт.',
+      );
+    }
+    DebugMonitor.log('IMPORT', 'rd_folder', 'Импорт из портативной папки: ${ini.path}');
+    final res = await importRocketDock135Ini(
+      ini,
+      targetDockId: targetDockId,
+      importVisualSettings: importVisualSettings,
+      replaceExistingItems: replaceExistingItems,
+    );
+    return RocketDockImportResult(
+      ok: res.ok,
+      importedItems: res.importedItems,
+      importedSettings: res.importedSettings,
+      message: res.ok ? 'Из ${ini.path}: ${res.message}' : res.message,
+    );
+  }
+
+  /// Auto-detect and import RocketDock 1.3.5 — PORTABLE-FIRST!
+  /// 1. Detects currently RUNNING portable `RocketDock.exe` and reads its exact folder & Settings.ini!
+  /// 2. Checks sibling folders next to AeroDock & standard Windows RocketDock folders.
+  /// 3. Falls back to Windows Registry (`HKCU\Software\RocketDock`) ONLY if no portable INI exists.
   Future<RocketDockImportResult> autoImportRocketDockFromSystem({
     required int targetDockId,
     bool importVisualSettings = true,
     bool replaceExistingItems = true,
   }) async {
-    DebugMonitor.log('IMPORT', 'rd_auto', 'Поиск RocketDock 1.3.5 в Реестре Windows и Program Files…');
+    DebugMonitor.log('IMPORT', 'rd_auto', 'Поиск запущенного портативного RocketDock.exe…');
 
-    // 1. Try Windows Registry HKCU\Software\RocketDock (where 90% of RocketDock 1.3.5 installs store icons!)
+    // 1. PORTABLE FIRST: Check currently running RocketDock.exe process directory!
+    final runningDir = await Win32Bridge.findRunningProcessDir('rocketdock.exe');
+    if (runningDir != null) {
+      DebugMonitor.log('IMPORT', 'rd_auto', 'Найден запущенный RocketDock в ${runningDir.path}');
+      final ini = Win32Bridge.findRocketDockIniInFolder(runningDir);
+      if (ini != null) {
+        final res = await importRocketDock135Ini(
+          ini,
+          targetDockId: targetDockId,
+          importVisualSettings: importVisualSettings,
+          replaceExistingItems: replaceExistingItems,
+        );
+        if (res.ok && res.importedItems > 0) {
+          return RocketDockImportResult(
+            ok: true,
+            importedItems: res.importedItems,
+            importedSettings: res.importedSettings,
+            message: 'Из запущенного портативного RocketDock (${ini.path}): ${res.message}',
+          );
+        }
+      }
+    }
+
+    // 2. Check sibling portable folders next to AeroDock + standard Program Files / AppData
+    final parentDir = portableDir.parent;
+    final portableCandidates = <File>[];
+    for (final name in ['RocketDock', 'RocketDockPortable', 'RocketDock 1.3.5']) {
+      final d = Directory(p.join(parentDir.path, name));
+      if (d.existsSync()) {
+        final f = Win32Bridge.findRocketDockIniInFolder(d);
+        if (f != null) portableCandidates.add(f);
+      }
+    }
+    final installedIni = Win32Bridge.findInstalledRocketDockIni();
+    if (installedIni != null) portableCandidates.add(installedIni);
+
+    for (final candidate in portableCandidates) {
+      DebugMonitor.log('IMPORT', 'rd_auto', 'Проверка файла ${candidate.path}');
+      final res = await importRocketDock135Ini(
+        candidate,
+        targetDockId: targetDockId,
+        importVisualSettings: importVisualSettings,
+        replaceExistingItems: replaceExistingItems,
+      );
+      if (res.ok && res.importedItems > 0) {
+        return RocketDockImportResult(
+          ok: true,
+          importedItems: res.importedItems,
+          importedSettings: res.importedSettings,
+          message: 'Из ${candidate.path}: ${res.message}',
+        );
+      }
+    }
+
+    // 3. Fallback: Windows Registry HKCU\Software\RocketDock (even portable RocketDock uses it if INI mode is unchecked)
     File? tempReg;
     try {
       tempReg = await Win32Bridge.exportRocketDockRegistryToFile(Directory.systemTemp);
@@ -1869,7 +1990,7 @@ class PortableIniStore {
             ok: true,
             importedItems: res.importedItems,
             importedSettings: res.importedSettings,
-            message: 'Из Реестра Windows (RocketDock 1.3.5): ${res.message}',
+            message: 'Из конфигурации RocketDock (Реестр): ${res.message}',
           );
         }
       }
@@ -1879,31 +2000,16 @@ class PortableIniStore {
       } catch (_) {}
     }
 
-    // 2. Fallback to Program Files / AppData Settings.ini
-    final installedIni = Win32Bridge.findInstalledRocketDockIni();
-    if (installedIni != null) {
-      DebugMonitor.log('IMPORT', 'rd_auto', 'Найден файл ${installedIni.path}');
-      final res = await importRocketDock135Ini(
-        installedIni,
-        targetDockId: targetDockId,
-        importVisualSettings: importVisualSettings,
-        replaceExistingItems: replaceExistingItems,
-      );
-      return RocketDockImportResult(
-        ok: res.ok,
-        importedItems: res.importedItems,
-        importedSettings: res.importedSettings,
-        message: 'Из ${installedIni.path}: ${res.message}',
-      );
-    }
-
-    DebugMonitor.log('WARN', 'rd_auto', 'RocketDock 1.3.5 не найден ни в Реестре Windows, ни в Program Files');
-    return const RocketDockImportResult(
+    final runningHint = runningDir != null
+        ? 'Запущенный RocketDock найден в ${runningDir.path}, но Settings.ini в нём пустой или отсутствует.'
+        : 'Запущенный RocketDock.exe не найден.';
+    DebugMonitor.log('WARN', 'rd_auto', '$runningHint Не удалось найти значки автоматически.');
+    return RocketDockImportResult(
       ok: false,
       importedItems: 0,
       importedSettings: false,
       message:
-          'RocketDock 1.3.5 не найден в Реестре Windows (HKCU\\Software\\RocketDock) и в Program Files. Включите в RocketDock «Хранить настройки в INI» или выберите его .ini / .reg файл вручную.',
+          '$runningHint Нажмите «Выбрать папку RocketDock…» и укажите вашу портативную папку RocketDock (или выберите его Settings.ini вручную).',
     );
   }
 

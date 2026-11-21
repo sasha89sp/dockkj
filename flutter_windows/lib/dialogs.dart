@@ -329,12 +329,33 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
 
   Future<void> _autoImportRocketDockFromSystem() async {
     _liveSaveTimer?.cancel();
-    _setBanner('Поиск RocketDock 1.3.5 в Реестре Windows и Program Files…');
+    _setBanner('Поиск запущенного портативного RocketDock.exe и его Settings.ini…');
     final importRes = await widget.store.autoImportRocketDockFromSystem(
       targetDockId: _rdImportTargetDock,
       importVisualSettings: _rdImportVisuals,
       replaceExistingItems: _rdImportReplace,
     );
+    _applyImportResultToDraft(importRes);
+  }
+
+  Future<void> _importRocketDockFolder() async {
+    final folderPath = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Выберите портативную папку RocketDock (где лежит RocketDock.exe / Settings.ini)',
+    );
+    if (folderPath == null || folderPath.trim().isEmpty) return;
+
+    _liveSaveTimer?.cancel();
+    _setBanner('Импорт из портативной папки RocketDock…');
+    final importRes = await widget.store.importRocketDockFolder(
+      Directory(folderPath),
+      targetDockId: _rdImportTargetDock,
+      importVisualSettings: _rdImportVisuals,
+      replaceExistingItems: _rdImportReplace,
+    );
+    _applyImportResultToDraft(importRes);
+  }
+
+  void _applyImportResultToDraft(RocketDockImportResult importRes) {
     if (!mounted) return;
     setState(() {
       _global = widget.store.global.copy();
@@ -475,24 +496,35 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       (Icons.monitor_heart_rounded, 'Отладка'),
     ];
 
-    return Container(
-      width: 790,
-      height: 580,
+    final dialogCard = Container(
+      width: widget.isStandaloneWindow ? double.infinity : 790,
+      height: widget.isStandaloneWindow ? double.infinity : 580,
       decoration: BoxDecoration(
         color: const Color(0xF70F172A),
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
-        boxShadow: const [
-          BoxShadow(color: Color(0xB3000000), blurRadius: 32, offset: Offset(0, 14)),
-        ],
+        boxShadow: widget.isStandaloneWindow
+            ? null
+            : const [
+                BoxShadow(color: Color(0xB3000000), blurRadius: 32, offset: Offset(0, 14)),
+              ],
       ),
       child: Column(
         children: [
-          // Header with Dock 1 / 2 / 3 / Разработка profile switcher (draggable when standalone)
+          // Header with Dock 1 / 2 / 3 / Разработка profile switcher (draggable & double-click maximize)
           GestureDetector(
             behavior: HitTestBehavior.translucent,
             onPanStart: widget.isStandaloneWindow
                 ? (_) => windowManager.startDragging()
+                : null,
+            onDoubleTap: widget.isStandaloneWindow
+                ? () async {
+                    if (await windowManager.isMaximized()) {
+                      await windowManager.unmaximize();
+                    } else {
+                      await windowManager.maximize();
+                    }
+                  }
                 : null,
             child: Container(
               height: 52,
@@ -592,6 +624,19 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  if (widget.isStandaloneWindow)
+                    IconButton(
+                      tooltip: 'Развернуть / Восстановить размер',
+                      onPressed: () async {
+                        if (await windowManager.isMaximized()) {
+                          await windowManager.unmaximize();
+                        } else {
+                          await windowManager.maximize();
+                        }
+                      },
+                      icon: const Icon(Icons.crop_square_rounded, size: 16, color: Colors.white70),
+                      splashRadius: 16,
+                    ),
                   IconButton(
                     tooltip: 'Сохранить и закрыть',
                     onPressed: _saveAndClose,
@@ -793,6 +838,9 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
         ],
       ),
     );
+
+    if (!widget.isStandaloneWindow) return dialogCard;
+    return _ResizableFramelessWindow(child: dialogCard);
   }
 
   // ---- TAB 0: General + RocketDock 1.3.5 INI Importer ----
@@ -824,7 +872,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               ),
               const SizedBox(height: 5),
               const Text(
-                'RocketDock 1.3.5 по умолчанию хранит ярлыки в Реестре Windows (HKCU\\Software\\RocketDock) — используйте кнопку «Авто-импорт» ниже. Также поддерживаются файлы Settings.ini / .reg (RocketDock 1.3.5 и AeroDock — переносит все 4 панели).',
+                'Для портативного RocketDock 1.3.5: нажмите «Найти запущенный RocketDock» (если он открыт) или «Папка RocketDock…», чтобы перенести значки и их PNG/ICO-иконки прямо из вашей портативной папки. Также можно выбрать Settings.ini вручную или перетащить его на панель.',
                 style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.35),
               ),
               const SizedBox(height: 10),
@@ -855,7 +903,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   ElevatedButton.icon(
                     onPressed: _autoImportRocketDockFromSystem,
                     icon: const Icon(Icons.auto_fix_high_rounded, size: 15),
-                    label: const Text('Авто-импорт RocketDock (Реестр)', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+                    label: const Text('Найти запущенный RocketDock', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF10B981),
                       foregroundColor: const Color(0xFF020617),
@@ -863,10 +911,20 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
                   ),
+                  OutlinedButton.icon(
+                    onPressed: _importRocketDockFolder,
+                    icon: const Icon(Icons.folder_special_rounded, size: 15, color: Color(0xFF38BDF8)),
+                    label: const Text('Папка RocketDock…', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Color(0xFF7DD3FC))),
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Color(0x8838BDF8)),
+                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
                   ElevatedButton.icon(
                     onPressed: _importRocketDock135,
-                    icon: const Icon(Icons.folder_open_rounded, size: 15),
-                    label: const Text('Выбрать .ini / .reg…', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+                    icon: const Icon(Icons.file_open_rounded, size: 15),
+                    label: const Text('Выбрать .ini файл…', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF38BDF8),
                       foregroundColor: const Color(0xFF020617),
@@ -3923,55 +3981,73 @@ class _LiveDebugMonitorPanelState extends State<LiveDebugMonitorPanel> {
 
     if (!widget.isStandalone) return content;
 
-    // Standalone floating monitor chrome
-    return Container(
-      width: 680,
-      height: 560,
-      decoration: BoxDecoration(
-        color: const Color(0xF50F172A),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0x6634D399)),
-        boxShadow: const [
-          BoxShadow(color: Color(0xB3000000), blurRadius: 28, offset: Offset(0, 10)),
-        ],
-      ),
-      child: Column(
-        children: [
-          GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onPanStart: (_) => windowManager.startDragging(),
-            child: Container(
-              height: 44,
-              padding: const EdgeInsets.symmetric(horizontal: 14),
-              decoration: const BoxDecoration(
-                border: Border(bottom: BorderSide(color: Color(0x1FFFFFFF))),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.monitor_heart_rounded, color: Color(0xFF34D399), size: 18),
-                  const SizedBox(width: 8),
-                  const Text(
-                    'AeroDock — Монитор отладки и нагрузки (Live)',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white),
-                  ),
-                  const Spacer(),
-                  if (widget.onClose != null)
+    // Standalone resizable floating monitor chrome
+    return _ResizableFramelessWindow(
+      child: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: BoxDecoration(
+          color: const Color(0xF50F172A),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0x6634D399)),
+        ),
+        child: Column(
+          children: [
+            GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onPanStart: (_) => windowManager.startDragging(),
+              onDoubleTap: () async {
+                if (await windowManager.isMaximized()) {
+                  await windowManager.unmaximize();
+                } else {
+                  await windowManager.maximize();
+                }
+              },
+              child: Container(
+                height: 44,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: const BoxDecoration(
+                  border: Border(bottom: BorderSide(color: Color(0x1FFFFFFF))),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.monitor_heart_rounded, color: Color(0xFF34D399), size: 18),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'AeroDock — Монитор отладки и нагрузки (Live)',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white),
+                    ),
+                    const Spacer(),
                     IconButton(
-                      onPressed: widget.onClose,
-                      icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
+                      tooltip: 'Развернуть / Восстановить размер',
+                      onPressed: () async {
+                        if (await windowManager.isMaximized()) {
+                          await windowManager.unmaximize();
+                        } else {
+                          await windowManager.maximize();
+                        }
+                      },
+                      icon: const Icon(Icons.crop_square_rounded, size: 15, color: Colors.white70),
                       splashRadius: 16,
                     ),
-                ],
+                    if (widget.onClose != null)
+                      IconButton(
+                        onPressed: widget.onClose,
+                        icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
+                        splashRadius: 16,
+                      ),
+                  ],
+                ),
               ),
             ),
-          ),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(14),
-              child: content,
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(14),
+                child: content,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -3995,6 +4071,131 @@ class _LiveDebugMonitorPanelState extends State<LiveDebugMonitorPanel> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Interactive 8-direction drag-resize frame + bottom-right resize grip for frameless Windows windows.
+class _ResizableFramelessWindow extends StatelessWidget {
+  final Widget child;
+
+  const _ResizableFramelessWindow({required this.child});
+
+  Widget _edgeZone({
+    required ResizeEdge edge,
+    required MouseCursor cursor,
+    double? left,
+    double? right,
+    double? top,
+    double? bottom,
+    double? width,
+    double? height,
+  }) {
+    return Positioned(
+      left: left,
+      right: right,
+      top: top,
+      bottom: bottom,
+      width: width,
+      height: height,
+      child: MouseRegion(
+        cursor: cursor,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onPanStart: (_) => windowManager.startResizing(edge),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const edgeThickness = 7.0;
+    const cornerSize = 16.0;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        // 4 edges
+        _edgeZone(
+          edge: ResizeEdge.top,
+          cursor: SystemMouseCursors.resizeUpDown,
+          left: cornerSize,
+          right: cornerSize,
+          top: 0,
+          height: edgeThickness,
+        ),
+        _edgeZone(
+          edge: ResizeEdge.bottom,
+          cursor: SystemMouseCursors.resizeUpDown,
+          left: cornerSize,
+          right: cornerSize,
+          bottom: 0,
+          height: edgeThickness,
+        ),
+        _edgeZone(
+          edge: ResizeEdge.left,
+          cursor: SystemMouseCursors.resizeLeftRight,
+          top: cornerSize,
+          bottom: cornerSize,
+          left: 0,
+          width: edgeThickness,
+        ),
+        _edgeZone(
+          edge: ResizeEdge.right,
+          cursor: SystemMouseCursors.resizeLeftRight,
+          top: cornerSize,
+          bottom: cornerSize,
+          right: 0,
+          width: edgeThickness,
+        ),
+        // 4 corners
+        _edgeZone(
+          edge: ResizeEdge.topLeft,
+          cursor: SystemMouseCursors.resizeUpLeftDownRight,
+          left: 0,
+          top: 0,
+          width: cornerSize,
+          height: cornerSize,
+        ),
+        _edgeZone(
+          edge: ResizeEdge.topRight,
+          cursor: SystemMouseCursors.resizeUpRightDownLeft,
+          right: 0,
+          top: 0,
+          width: cornerSize,
+          height: cornerSize,
+        ),
+        _edgeZone(
+          edge: ResizeEdge.bottomLeft,
+          cursor: SystemMouseCursors.resizeUpRightDownLeft,
+          left: 0,
+          bottom: 0,
+          width: cornerSize,
+          height: cornerSize,
+        ),
+        // Bottom-right corner with visible subtle resize grip
+        Positioned(
+          right: 0,
+          bottom: 0,
+          width: 20,
+          height: 20,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.resizeUpLeftDownRight,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanStart: (_) => windowManager.startResizing(ResizeEdge.bottomRight),
+              child: const Align(
+                alignment: Alignment.bottomRight,
+                child: Padding(
+                  padding: EdgeInsets.only(right: 4, bottom: 4),
+                  child: Icon(Icons.signal_cellular_4_bar_rounded, size: 11, color: Colors.white38),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

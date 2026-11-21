@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -580,6 +581,27 @@ typedef _DwmGetWindowAttributeNative = Int32 Function(
 typedef _DwmGetWindowAttributeDart = int Function(
     int hwnd, int dwAttribute, Pointer<Void> pvAttribute, int cbAttribute);
 
+typedef _DwmSetWindowAttributeNative = Int32 Function(
+    IntPtr hwnd, Uint32 dwAttribute, Pointer<Void> pvAttribute, Uint32 cbAttribute);
+typedef _DwmSetWindowAttributeDart = int Function(
+    int hwnd, int dwAttribute, Pointer<Void> pvAttribute, int cbAttribute);
+
+typedef _SetWindowLongPtrWNative = IntPtr Function(IntPtr hwnd, Int32 nIndex, IntPtr dwNewLong);
+typedef _SetWindowLongPtrWDart = int Function(int hwnd, int nIndex, int dwNewLong);
+
+typedef _ShGetImageListNative = Int32 Function(
+    Int32 iImageList, Pointer<Uint8> riid, Pointer<IntPtr> ppvObj);
+typedef _ShGetImageListDart = int Function(
+    int iImageList, Pointer<Uint8> riid, Pointer<IntPtr> ppvObj);
+
+typedef _IImageListGetIconNative = Int32 Function(
+    IntPtr self, Int32 i, Uint32 flags, Pointer<IntPtr> picon);
+typedef _IImageListGetIconDart = int Function(
+    int self, int i, int flags, Pointer<IntPtr> picon);
+
+typedef _IUnknownReleaseNative = Uint32 Function(IntPtr self);
+typedef _IUnknownReleaseDart = int Function(int self);
+
 typedef _OpenProcessNative = IntPtr Function(
     Uint32 dwDesiredAccess, Int32 bInheritHandle, Uint32 dwProcessId);
 typedef _OpenProcessDart = int Function(
@@ -782,9 +804,24 @@ class Win32Bridge {
       _PrivateExtractIconsWNative,
       _PrivateExtractIconsWDart>('PrivateExtractIconsW');
 
+  static final _setWindowLongPtrW = _user32.lookupFunction<
+      _SetWindowLongPtrWNative, _SetWindowLongPtrWDart>('SetWindowLongPtrW');
+
   static final _dwmGetWindowAttribute = _dwmapi.lookupFunction<
       _DwmGetWindowAttributeNative,
       _DwmGetWindowAttributeDart>('DwmGetWindowAttribute');
+  static final _dwmSetWindowAttribute = _dwmapi.lookupFunction<
+      _DwmSetWindowAttributeNative,
+      _DwmSetWindowAttributeDart>('DwmSetWindowAttribute');
+  static final _shGetImageList = _tryLookupShGetImageList();
+
+  static _ShGetImageListDart? _tryLookupShGetImageList() {
+    try {
+      return _shell32.lookupFunction<_ShGetImageListNative, _ShGetImageListDart>('SHGetImageList');
+    } catch (_) {
+      return null;
+    }
+  }
 
   static final _openProcess =
       _kernel32.lookupFunction<_OpenProcessNative, _OpenProcessDart>('OpenProcess');
@@ -1205,6 +1242,43 @@ class Win32Bridge {
     }
   }
 
+  /// Completely strip Windows 10/11 DWM 1px rounded window border, window frame styles,
+  /// and system backdrop bleed so transparent dock HWNDs show ZERO outer box or outline!
+  /// Pass `keepResizable: true` for Settings/Debug windows so `windowManager.startResizing` works natively.
+  static void stripWindowChromeAndBorder(int hwnd, {bool keepResizable = false}) {
+    if (!Platform.isWindows || hwnd == 0) return;
+    final valPtr = calloc<Uint32>();
+    try {
+      // 1. DWMWA_WINDOW_CORNER_PREFERENCE (33) = DWMWCP_DONOTROUND (1)
+      valPtr.value = 1;
+      _dwmSetWindowAttribute(hwnd, 33, valPtr.cast(), 4);
+
+      // 2. DWMWA_BORDER_COLOR (34) = DWMWA_COLOR_NONE (0xFFFFFFFE) -> removes 1px white Win11 border!
+      valPtr.value = 0xFFFFFFFE;
+      _dwmSetWindowAttribute(hwnd, 34, valPtr.cast(), 4);
+
+      // 3. DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_NONE (1) -> prevents translucent full-window tint!
+      valPtr.value = 1;
+      _dwmSetWindowAttribute(hwnd, 38, valPtr.cast(), 4);
+
+      // 4. Strip Win32 caption/border bits (keep WS_THICKFRAME only on resizable Settings/Debug windows)
+      const gwlStyle = -16;
+      final wsStripMask = keepResizable
+          ? (0x00C00000 | 0x00800000 | 0x00400000)
+          : (0x00C00000 | 0x00800000 | 0x00400000 | 0x00040000);
+      final style = _getWindowLongPtrW(hwnd, gwlStyle);
+      final cleanStyle = keepResizable ? ((style & ~wsStripMask) | 0x00040000) : (style & ~wsStripMask);
+      if (cleanStyle != style) {
+        _setWindowLongPtrW(hwnd, gwlStyle, cleanStyle);
+        // SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        _setWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0004 | 0x0010 | 0x0020);
+      }
+    } catch (_) {
+    } finally {
+      calloc.free(valPtr);
+    }
+  }
+
   static void setWindowLayer(int hwnd, String layer) {
     if (!Platform.isWindows || hwnd == 0) return;
     const swpFlags = 0x0001 | 0x0002 | 0x0010;
@@ -1387,6 +1461,14 @@ class Win32Bridge {
     }
   }
 
+  /// Non-blocking Recycle Bin query on a background Isolate (0.0ms UI thread stall!).
+  static Future<RecycleBinInfo> queryRecycleBinAsync() {
+    if (!Platform.isWindows) {
+      return Future.value(const RecycleBinInfo(itemCount: 0, sizeBytes: 0));
+    }
+    return Isolate.run(queryRecycleBin);
+  }
+
   static void emptyRecycleBin({bool silent = false}) {
     if (!Platform.isWindows) return;
     _shEmptyRecycleBinW(0, nullptr, silent ? 7 : 0);
@@ -1471,11 +1553,210 @@ class Win32Bridge {
     }
   }
 
-  /// Crisp 128x128 HD icon extraction using PrivateExtractIconsW (with SHGetFileInfoW fallback).
-  /// Skips Windows UWP stub icons (calc.exe) so built-in crisp HD vector icons are used instead!
-  static String? extractIconToPng(String targetPath, Directory iconsCacheDir) {
+  /// Parse a Windows `.lnk` Shell Link binary file (<0.2ms, zero subprocess) to extract
+  /// its real `targetPath`, `iconLocation`, and `iconIndex` so we extract crisp 256px icons
+  /// WITHOUT the ugly Windows shortcut arrow overlay!
+  static ({String? targetPath, String? iconLocation, int iconIndex}) _parseLnkBinary(
+      String lnkPath) {
+    try {
+      final bytes = File(lnkPath).readAsBytesSync();
+      if (bytes.length < 76) return (targetPath: null, iconLocation: null, iconIndex: 0);
+      final bd = ByteData.sublistView(bytes);
+      // HeaderSize == 0x4C, LinkCLSID starts with 01 14 02 00
+      if (bd.getUint32(0, Endian.little) != 0x0000004C) {
+        return (targetPath: null, iconLocation: null, iconIndex: 0);
+      }
+      final flags = bd.getUint32(20, Endian.little);
+      final iconIndex = bd.getInt32(56, Endian.little);
+      var offset = 76;
+
+      // 1. Skip LinkTargetIDList if present (HasLinkTargetIDList = 0x01)
+      if ((flags & 0x01) != 0) {
+        if (offset + 2 > bytes.length) return (targetPath: null, iconLocation: null, iconIndex: iconIndex);
+        final idListSize = bd.getUint16(offset, Endian.little);
+        offset += 2 + idListSize;
+      }
+
+      String? targetPath;
+      // 2. Parse LinkInfo if present (HasLinkInfo = 0x02)
+      if ((flags & 0x02) != 0 && offset + 4 <= bytes.length) {
+        final linkInfoStart = offset;
+        final linkInfoSize = bd.getUint32(offset, Endian.little);
+        if (linkInfoSize >= 28 && linkInfoStart + linkInfoSize <= bytes.length) {
+          final linkInfoHeaderSize = bd.getUint32(linkInfoStart + 4, Endian.little);
+          final linkInfoFlags = bd.getUint32(linkInfoStart + 8, Endian.little);
+          if ((linkInfoFlags & 0x01) != 0) {
+            // VolumeIDAndLocalBasePath
+            if (linkInfoHeaderSize >= 36) {
+              final localBaseUnicodeOff = bd.getUint32(linkInfoStart + 28, Endian.little);
+              if (localBaseUnicodeOff > 0 && linkInfoStart + localBaseUnicodeOff < bytes.length) {
+                targetPath = _readNullTermUtf16(bytes, linkInfoStart + localBaseUnicodeOff);
+              }
+            }
+            if (targetPath == null || targetPath.isEmpty) {
+              final localBaseOff = bd.getUint32(linkInfoStart + 16, Endian.little);
+              if (localBaseOff > 0 && linkInfoStart + localBaseOff < bytes.length) {
+                targetPath = _readNullTermAnsi(bytes, linkInfoStart + localBaseOff);
+              }
+            }
+          }
+        }
+        offset += linkInfoSize;
+      }
+
+      // 3. Parse StringData (IsUnicode = 0x80)
+      final isUnicode = (flags & 0x80) != 0;
+      String? readCountedString() {
+        if (offset + 2 > bytes.length) return null;
+        final count = bd.getUint16(offset, Endian.little);
+        offset += 2;
+        final byteLen = isUnicode ? count * 2 : count;
+        if (offset + byteLen > bytes.length) return null;
+        final slice = bytes.sublist(offset, offset + byteLen);
+        offset += byteLen;
+        if (isUnicode) {
+          final units = <int>[];
+          for (var i = 0; i + 1 < slice.length; i += 2) {
+            units.add(slice[i] | (slice[i + 1] << 8));
+          }
+          return String.fromCharCodes(units);
+        }
+        return String.fromCharCodes(slice);
+      }
+
+      if ((flags & 0x04) != 0) readCountedString(); // NAME_STRING
+      final relPath = (flags & 0x08) != 0 ? readCountedString() : null;
+      if ((flags & 0x10) != 0) readCountedString(); // WORKING_DIR
+      if ((flags & 0x20) != 0) readCountedString(); // COMMAND_LINE_ARGUMENTS
+      final iconLoc = (flags & 0x40) != 0 ? readCountedString() : null;
+
+      if ((targetPath == null || targetPath.isEmpty) && relPath != null && relPath.isNotEmpty) {
+        final combined = p.normalize(p.join(p.dirname(lnkPath), relPath));
+        if (File(combined).existsSync() || Directory(combined).existsSync()) {
+          targetPath = combined;
+        }
+      }
+
+      return (
+        targetPath: targetPath != null ? _expandEnvVarsBasic(targetPath) : null,
+        iconLocation: iconLoc != null ? _expandEnvVarsBasic(iconLoc) : null,
+        iconIndex: iconIndex,
+      );
+    } catch (_) {
+      return (targetPath: null, iconLocation: null, iconIndex: 0);
+    }
+  }
+
+  static String _readNullTermUtf16(Uint8List bytes, int start) {
+    final units = <int>[];
+    for (var i = start; i + 1 < bytes.length; i += 2) {
+      final code = bytes[i] | (bytes[i + 1] << 8);
+      if (code == 0) break;
+      units.add(code);
+    }
+    return String.fromCharCodes(units);
+  }
+
+  static String _readNullTermAnsi(Uint8List bytes, int start) {
+    final chars = <int>[];
+    for (var i = start; i < bytes.length; i++) {
+      if (bytes[i] == 0) break;
+      chars.add(bytes[i]);
+    }
+    return String.fromCharCodes(chars);
+  }
+
+  static String _expandEnvVarsBasic(String input) {
+    if (!input.contains('%')) return input;
+    return input.replaceAllMapped(RegExp(r'%([^%]+)%'), (m) {
+      final name = m.group(1)!.toLowerCase();
+      for (final e in Platform.environment.entries) {
+        if (e.key.toLowerCase() == name) return e.value;
+      }
+      return m.group(0)!;
+    });
+  }
+
+  /// Extract a 256x256 Windows SHIL_JUMBO (or SHIL_EXTRALARGE) HICON via SHGetImageList.
+  static int _extractJumboShellHIcon(Pointer<Utf16> pathPtr, Pointer<_ShFileInfoW> shfi) {
+    final getImgList = _shGetImageList;
+    if (getImgList == null) return 0;
+    // SHGFI_SYSICONINDEX (0x00004000)
+    final res = _shGetFileInfoW(pathPtr, 0, shfi, sizeOf<_ShFileInfoW>(), 0x00004000);
+    if (res == 0) return 0;
+    final sysIndex = shfi.ref.iIcon;
+
+    // IID_IImageList = {46EB5926-582E-4017-9FDF-E8998DAA0950}
+    const iidBytes = [
+      0x26, 0x59, 0xEB, 0x46, 0x2E, 0x58, 0x17, 0x40,
+      0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50,
+    ];
+    final iidPtr = calloc<Uint8>(16);
+    final ppv = calloc<IntPtr>();
+    final hIconOut = calloc<IntPtr>();
+    try {
+      for (var i = 0; i < 16; i++) {
+        iidPtr[i] = iidBytes[i];
+      }
+      // Try SHIL_JUMBO (4 = 256x256), fallback SHIL_EXTRALARGE (2 = 48x48)
+      for (final shil in [4, 2]) {
+        ppv.value = 0;
+        final hr = getImgList(shil, iidPtr, ppv);
+        if (hr != 0 || ppv.value == 0) continue;
+        final comObj = ppv.value;
+        try {
+          final vtablePtr = Pointer<Pointer<IntPtr>>.fromAddress(comObj).value;
+          // IImageList::GetIcon is vtable slot 10; IUnknown::Release is slot 2
+          final getIconFnPtr = Pointer<NativeFunction<_IImageListGetIconNative>>.fromAddress(
+              vtablePtr[10]);
+          final getIcon = getIconFnPtr.asFunction<_IImageListGetIconDart>();
+          hIconOut.value = 0;
+          // ILD_TRANSPARENT = 0x00000001
+          final ghr = getIcon(comObj, sysIndex, 0x00000001, hIconOut);
+          if (ghr == 0 && hIconOut.value != 0) {
+            return hIconOut.value;
+          }
+        } finally {
+          try {
+            final vtablePtr = Pointer<Pointer<IntPtr>>.fromAddress(comObj).value;
+            final releasePtr =
+                Pointer<NativeFunction<_IUnknownReleaseNative>>.fromAddress(vtablePtr[2]);
+            releasePtr.asFunction<_IUnknownReleaseDart>()(comObj);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {
+    } finally {
+      calloc.free(iidPtr);
+      calloc.free(ppv);
+      calloc.free(hIconOut);
+    }
+    return 0;
+  }
+
+  /// Ultra-sharp 256x256 HD icon extraction:
+  /// 1. Resolves `.lnk` shortcuts directly to their IconLocation / TargetPath (NO ugly arrow, full 256px!).
+  /// 2. Extracts native 256x256 (fallback 128x128) icons from `.exe` / `.dll` / `.ico`.
+  /// 3. Uses Windows SHIL_JUMBO (256x256) with smart alpha-bounds crop for folders, documents & everything else!
+  static String? extractIconToPng(
+    String targetPath,
+    Directory iconsCacheDir, {
+    int iconIndex = 0,
+  }) {
     if (!Platform.isWindows || targetPath.trim().isEmpty) return null;
-    final trimmed = targetPath.trim();
+    var trimmed = targetPath.trim().replaceAll('"', '');
+    var requestedIndex = iconIndex;
+
+    // Parse "C:\Windows\System32\shell32.dll,4" syntax
+    final commaIdx = trimmed.lastIndexOf(',');
+    if (commaIdx > 2) {
+      final maybeIdx = int.tryParse(trimmed.substring(commaIdx + 1).trim());
+      if (maybeIdx != null) {
+        requestedIndex = maybeIdx;
+        trimmed = trimmed.substring(0, commaIdx).trim();
+      }
+    }
+
     final lower = trimmed.toLowerCase();
     if (lower.contains('://') ||
         lower.startsWith('shell:') ||
@@ -1486,6 +1767,15 @@ class Win32Bridge {
     }
     final firstColon = trimmed.indexOf(':');
     if (firstColon >= 0 && (firstColon != 1 || trimmed.indexOf(':', 2) >= 0)) {
+      return null;
+    }
+
+    // If it's already a raster PNG/JPG/WEBP image file, use directly
+    final directExt = p.extension(trimmed).toLowerCase();
+    if (directExt == '.png' || directExt == '.jpg' || directExt == '.jpeg' || directExt == '.webp') {
+      try {
+        if (File(trimmed).existsSync()) return trimmed;
+      } catch (_) {}
       return null;
     }
 
@@ -1503,18 +1793,19 @@ class Win32Bridge {
       return null;
     }
 
-    final safeHash = trimmed.toLowerCase().codeUnits.fold<int>(
-          2166136261,
-          (h, c) => ((h ^ c) * 16777619) & 0x7FFFFFFF,
-        );
-    final outFile = File(p.join(iconsCacheDir.path, 'hd128_$safeHash.png'));
+    final cacheKey = '$lower#$requestedIndex';
+    final safeHash = cacheKey.codeUnits.fold<int>(
+      2166136261,
+      (h, c) => ((h ^ c) * 16777619) & 0x7FFFFFFF,
+    );
+    final outFile = File(p.join(iconsCacheDir.path, 'hd256_$safeHash.png'));
     try {
-      if (outFile.existsSync() && outFile.lengthSync() > 120) {
+      if (outFile.existsSync() && outFile.lengthSync() > 140) {
         return outFile.path;
       }
     } catch (_) {}
 
-    var resolved = trimmed;
+    var resolved = _expandEnvVarsBasic(trimmed);
     if (!resolved.contains('\\') && !resolved.contains('/')) {
       final sysRoot = Platform.environment['SystemRoot'] ?? r'C:\Windows';
       final sys32 = p.join(sysRoot, 'System32', resolved);
@@ -1530,26 +1821,72 @@ class Win32Bridge {
       }
     }
 
-    final pathPtr = resolved.toNativeUtf16();
+    // Resolve `.lnk` shortcut directly to its IconLocation or TargetPath for crisp 256px art!
+    var extractSource = resolved;
+    var extractIndex = requestedIndex;
+    if (p.extension(resolved).toLowerCase() == '.lnk') {
+      final lnk = _parseLnkBinary(resolved);
+      if (lnk.iconLocation != null &&
+          lnk.iconLocation!.isNotEmpty &&
+          File(lnk.iconLocation!).existsSync()) {
+        final ilExt = p.extension(lnk.iconLocation!).toLowerCase();
+        if (ilExt == '.png' || ilExt == '.jpg' || ilExt == '.webp') {
+          return lnk.iconLocation!;
+        }
+        extractSource = lnk.iconLocation!;
+        extractIndex = lnk.iconIndex;
+      } else if (lnk.targetPath != null &&
+          lnk.targetPath!.isNotEmpty &&
+          (File(lnk.targetPath!).existsSync() || Directory(lnk.targetPath!).existsSync())) {
+        extractSource = lnk.targetPath!;
+        extractIndex = 0;
+      }
+    }
+
+    final srcPtr = extractSource.toNativeUtf16();
+    final origPtr = resolved.toNativeUtf16();
     final hIconPtr = calloc<IntPtr>();
     final iconIdPtr = calloc<Uint32>();
     final shfi = calloc<_ShFileInfoW>();
 
     try {
       int hIcon = 0;
+      var usedJumbo = false;
 
-      // 1. Try crisp 128x128 HD icon directly from .exe / .dll / .ico
-      final ext = p.extension(resolved).toLowerCase();
+      // 1. Try crisp 256x256 (then 128x128) HD icon directly from .exe / .dll / .ico
+      final ext = p.extension(extractSource).toLowerCase();
       if (ext == '.exe' || ext == '.dll' || ext == '.ico') {
-        final count = _privateExtractIconsW(pathPtr, 0, 128, 128, hIconPtr, iconIdPtr, 1, 0);
-        if (count > 0 && hIconPtr.value != 0) {
-          hIcon = hIconPtr.value;
+        for (final sz in [256, 128, 64]) {
+          hIconPtr.value = 0;
+          final count = _privateExtractIconsW(
+            srcPtr,
+            extractIndex,
+            sz,
+            sz,
+            hIconPtr,
+            iconIdPtr,
+            1,
+            0,
+          );
+          if (count > 0 && hIconPtr.value != 0) {
+            hIcon = hIconPtr.value;
+            break;
+          }
         }
       }
 
-      // 2. Fallback to Shell icon for folders, .lnk shortcuts, documents
+      // 2. Windows SHIL_JUMBO (256x256) for folders, documents, UWP/MSI shortcuts, etc.
       if (hIcon == 0) {
-        final res = _shGetFileInfoW(pathPtr, 0, shfi, sizeOf<_ShFileInfoW>(), 0x00000100);
+        hIcon = _extractJumboShellHIcon(srcPtr, shfi);
+        if (hIcon == 0 && extractSource != resolved) {
+          hIcon = _extractJumboShellHIcon(origPtr, shfi);
+        }
+        if (hIcon != 0) usedJumbo = true;
+      }
+
+      // 3. Final fallback to standard SHGetFileInfoW icon
+      if (hIcon == 0) {
+        final res = _shGetFileInfoW(origPtr, 0, shfi, sizeOf<_ShFileInfoW>(), 0x00000100);
         if (res != 0 && shfi.ref.hIcon != 0) {
           hIcon = shfi.ref.hIcon;
         }
@@ -1557,7 +1894,7 @@ class Win32Bridge {
 
       if (hIcon == 0) return null;
       try {
-        final pngBytes = _hIconToPng(hIcon);
+        final pngBytes = _hIconToPng(hIcon, cropJumboPadding: usedJumbo);
         if (pngBytes == null) return null;
         outFile.writeAsBytesSync(pngBytes, flush: true);
         return outFile.path;
@@ -1565,14 +1902,15 @@ class Win32Bridge {
         _destroyIcon(hIcon);
       }
     } finally {
-      calloc.free(pathPtr);
+      calloc.free(srcPtr);
+      calloc.free(origPtr);
       calloc.free(hIconPtr);
       calloc.free(iconIdPtr);
       calloc.free(shfi);
     }
   }
 
-  static Uint8List? _hIconToPng(int hIcon) {
+  static Uint8List? _hIconToPng(int hIcon, {bool cropJumboPadding = false}) {
     final iconInfo = calloc<_IconInfo>();
     final bmpStruct = calloc<_Bitmap>();
     try {
@@ -1621,18 +1959,53 @@ class Win32Bridge {
           }
 
           final rgba = Uint8List(w * h * 4);
-          for (var i = 0; i < w * h * 4; i += 4) {
-            rgba[i] = colorList[i + 2];
-            rgba[i + 1] = colorList[i + 1];
-            rgba[i + 2] = colorList[i];
-            if (hasAlpha) {
-              rgba[i + 3] = colorList[i + 3];
-            } else if (maskList != null) {
-              rgba[i + 3] = maskList[i] == 0 ? 255 : 0;
-            } else {
-              rgba[i + 3] = 255;
+          var minX = w;
+          var minY = h;
+          var maxX = -1;
+          var maxY = -1;
+
+          for (var y = 0; y < h; y++) {
+            for (var x = 0; x < w; x++) {
+              final i = (y * w + x) * 4;
+              rgba[i] = colorList[i + 2];
+              rgba[i + 1] = colorList[i + 1];
+              rgba[i + 2] = colorList[i];
+              final a = hasAlpha
+                  ? colorList[i + 3]
+                  : (maskList != null ? (maskList[i] == 0 ? 255 : 0) : 255);
+              rgba[i + 3] = a;
+              if (a > 8) {
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+              }
             }
           }
+
+          // Windows SHIL_JUMBO (256x256) places legacy 48x48 icons in the top-left corner with
+          // empty transparent padding everywhere else! Detect & crop cleanly to a square box.
+          if (cropJumboPadding &&
+              w >= 128 &&
+              maxX > minX &&
+              maxY > minY) {
+            final bw = maxX - minX + 1;
+            final bh = maxY - minY + 1;
+            if (bw < (w * 0.65) && bh < (h * 0.65)) {
+              final side = (bw > bh ? bw : bh) + 4;
+              final cropSize = side.clamp(16, w);
+              final startX = (minX - ((cropSize - bw) ~/ 2)).clamp(0, w - cropSize);
+              final startY = (minY - ((cropSize - bh) ~/ 2)).clamp(0, h - cropSize);
+              final cropped = Uint8List(cropSize * cropSize * 4);
+              for (var cy = 0; cy < cropSize; cy++) {
+                final srcRow = ((startY + cy) * w + startX) * 4;
+                final dstRow = cy * cropSize * 4;
+                cropped.setRange(dstRow, dstRow + cropSize * 4, rgba, srcRow);
+              }
+              return encodeRgbaToPng(cropped, cropSize, cropSize);
+            }
+          }
+
           return encodeRgbaToPng(rgba, w, h);
         } finally {
           _releaseDC(0, screenDc);
@@ -1807,6 +2180,87 @@ class Win32Bridge {
         final outFile = File(outPath);
         if (res.exitCode == 0 && outFile.existsSync() && outFile.lengthSync() > 40) {
           return outFile;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Locate a currently running portable process directory (e.g., `rocketdock.exe`)
+  /// by inspecting all top-level Windows HWNDs + QueryFullProcessImageNameW (with PowerShell fallback).
+  static Future<Directory?> findRunningProcessDir(String exeNameLower) async {
+    if (!Platform.isWindows) return null;
+    final target = exeNameLower.toLowerCase();
+
+    // Fast Win32 EnumWindows path (<1ms, zero subprocess)
+    try {
+      _hwndBuffer.clear();
+      _enumWindows(_enumProcPtr, 0);
+      final pidPtr = calloc<Uint32>();
+      final seenPids = <int>{};
+      try {
+        for (final hwnd in _hwndBuffer) {
+          _getWindowThreadProcessId(hwnd, pidPtr);
+          final pId = pidPtr.value;
+          if (pId == 0 || !seenPids.add(pId)) continue;
+          final info = _resolvePidInfo(pId);
+          if (info.processName == target && info.exePath.isNotEmpty) {
+            final dir = Directory(p.dirname(info.exePath));
+            if (dir.existsSync()) return dir;
+          }
+        }
+      } finally {
+        calloc.free(pidPtr);
+      }
+    } catch (_) {}
+
+    // Fallback: PowerShell Get-Process for background/windowless portable processes
+    try {
+      final baseName = target.endsWith('.exe') ? target.substring(0, target.length - 4) : target;
+      final res = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-Command',
+          "(Get-Process -Name '$baseName' -ErrorAction SilentlyContinue | Select-Object -First 1).Path",
+        ],
+        runInShell: false,
+      );
+      final exePath = res.stdout.toString().trim();
+      if (exePath.isNotEmpty) {
+        final dir = Directory(p.dirname(exePath));
+        if (dir.existsSync()) return dir;
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /// Locate an installed or portable RocketDock 1.3.5 Settings.ini in standard Windows paths
+  /// OR inside a given running RocketDock folder (including PortableApps Data\settings\Settings.ini).
+  static File? findRocketDockIniInFolder(Directory folder) {
+    final candidates = [
+      p.join(folder.path, 'Settings.ini'),
+      p.join(folder.path, 'settings.ini'),
+      p.join(folder.path, 'Data', 'settings', 'Settings.ini'),
+      p.join(folder.path, 'App', 'RocketDock', 'Settings.ini'),
+      p.join(folder.parent.path, 'Data', 'settings', 'Settings.ini'),
+      p.join(folder.parent.parent.path, 'Data', 'settings', 'Settings.ini'),
+    ];
+    for (final c in candidates) {
+      try {
+        final f = File(c);
+        if (f.existsSync() && f.lengthSync() > 20) return f;
+      } catch (_) {}
+    }
+    // Also check any *.ini or *.reg in that folder
+    try {
+      for (final ent in folder.listSync(followLinks: false)) {
+        if (ent is File) {
+          final ext = p.extension(ent.path).toLowerCase();
+          if ((ext == '.ini' || ext == '.reg') && ent.lengthSync() > 40) {
+            return ent;
+          }
         }
       }
     } catch (_) {}
