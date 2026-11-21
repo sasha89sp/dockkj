@@ -49,7 +49,7 @@ jobs:
       - name: Build Windows Release (.exe)
         run: flutter build windows --release
 
-      - name: Package Portable ZIP (Zero-Loss Upgrade: Settings.default.ini + Skins + Icons + Docklets + Languages + DevApps)
+      - name: "Package Portable ZIP (Settings.default.ini + Skins + Icons + Docklets + Languages + DevApps)"
         shell: pwsh
         run: |
           $out = "dist/AeroDock-Portable"
