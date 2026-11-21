@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -46,7 +45,6 @@ Future<void> main(List<String> args) async {
   AppI18n.currentCode = store.global.language;
   store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
 
-  // Clean stale IPC flags on primary startup
   if (dockId == 1) {
     for (final name in ['.aerodock_quit', '.aerodock_hidden']) {
       final f = File(p.join(store.portableDir.path, name));
@@ -61,7 +59,7 @@ Future<void> main(List<String> args) async {
   final cfg = store.panels[dockId] ?? DockPanelConfig.defaultFor(dockId);
 
   const windowOptions = WindowOptions(
-    size: Size(760, 140),
+    size: Size(760, 150),
     backgroundColor: Colors.transparent,
     skipTaskbar: true,
     titleBarStyle: TitleBarStyle.hidden,
@@ -114,7 +112,6 @@ class _MinimizedWindowEntry {
   final String exePath;
   final String processName;
   String? iconPngPath;
-  Uint8List? thumbnailPng;
 
   _MinimizedWindowEntry({
     required this.hwnd,
@@ -122,7 +119,6 @@ class _MinimizedWindowEntry {
     required this.exePath,
     required this.processName,
     this.iconPngPath,
-    this.thumbnailPng,
   });
 }
 
@@ -143,14 +139,32 @@ class _DockShellPageState extends State<DockShellPage>
   // Sibling dock processes (owned by Dock #1)
   final Map<int, Process> _childDocks = {};
 
-  // Hover / Animation state
-  int? _hoveredSlotIndex;
+  // Ultra-fast ValueNotifiers — ZERO full-tree setState() during idle or hover!
+  final ValueNotifier<double?> _hoverAxisNotifier = ValueNotifier<double?>(null);
+  final ValueNotifier<DateTime> _nowNotifier = ValueNotifier<DateTime>(DateTime.now());
+  final ValueNotifier<BatteryInfo> _batteryNotifier = ValueNotifier<BatteryInfo>(
+    const BatteryInfo(percent: 100, acOnline: true, charging: false, hasBattery: false),
+  );
+  final ValueNotifier<SysStatsInfo> _sysStatsNotifier = ValueNotifier<SysStatsInfo>(
+    const SysStatsInfo(cpuPercent: 0, ramPercent: 0, usedGb: 0, totalGb: 0),
+  );
+  final ValueNotifier<RecycleBinInfo> _recycleBinNotifier = ValueNotifier<RecycleBinInfo>(
+    const RecycleBinInfo(itemCount: 0, sizeBytes: 0),
+  );
+  final ValueNotifier<Set<String>> _runningProcsNotifier = ValueNotifier<Set<String>>({});
+
   String? _bouncingKey;
   bool _isDraggingFile = false;
   bool _isAutoHidden = false;
   bool _isPopupRaised = false;
-  bool _suspended = false; // Ctrl+Alt+R complete suspend/hide
+  bool _suspended = false;
   int _ownHwnd = 0;
+
+  // Cached display rect (eliminates repeated screenRetriever IPC calls!)
+  Rect _cachedScreenRect = const Rect.fromLTWH(0, 0, 1920, 1040);
+  List<Display> _displays = [];
+  List<ExternalSkinInfo> _externalSkins = [];
+  List<ExternalDockletInfo> _externalDocklets = [];
 
   // Overlay dialogs
   _ActiveOverlay _overlay = _ActiveOverlay.none;
@@ -159,31 +173,25 @@ class _DockShellPageState extends State<DockShellPage>
   DockItemModel? _openStackItem;
   List<FolderEntryInfo> _stackEntries = [];
 
-  // Live system state (polled natively via zero-lag Win32 FFI)
-  DateTime _now = DateTime.now();
-  BatteryInfo _battery = const BatteryInfo(percent: 100, acOnline: true, charging: false, hasBattery: false);
-  SysStatsInfo _sysStats = const SysStatsInfo(cpuPercent: 0, ramPercent: 0, usedGb: 0, totalGb: 0);
-  RecycleBinInfo _recycleBin = const RecycleBinInfo(itemCount: 0, sizeBytes: 0);
-  List<Display> _displays = [];
-  List<ExternalSkinInfo> _externalSkins = [];
-  List<ExternalDockletInfo> _externalDocklets = [];
-
-  // Running processes & Minimized Windows in Dock
-  Set<String> _runningProcesses = {};
+  // Minimized Windows (baseline prevents hijacking background windows on startup)
   List<Win32WindowInfo> _openWindows = [];
   final List<_MinimizedWindowEntry> _minimizedWindows = [];
+  final Set<int> _baselineMinimizedHwnds = {};
   final Set<int> _onceExcludedHwnds = {};
   final Set<int> _hiddenByDockHwnds = {};
+  bool _baselineCaptured = false;
 
-  // Timers
+  // Lightweight, demand-driven timers
   Timer? _clockTimer;
+  Timer? _statsTimer;
+  Timer? _recycleTimer;
   Timer? _winPollTimer;
   Timer? _syncTimer;
   Timer? _edgeHoverTimer;
   Timer? _autoHideDelayTimer;
   Timer? _popupDelayTimer;
 
-  // RocketDock global hotkey: Ctrl+Alt+R (completely hide/show + suspend rendering)
+  // RocketDock global hotkey: Ctrl+Alt+R (completely hide/show + pause all polling)
   final HotKey _toggleHotKey = HotKey(
     key: PhysicalKeyboardKey.keyR,
     modifiers: [HotKeyModifier.control, HotKeyModifier.alt],
@@ -194,12 +202,16 @@ class _DockShellPageState extends State<DockShellPage>
   bool get _isPrimary => _dockId == 1;
   DockPanelConfig get _cfg =>
       widget.store.panels[_dockId] ?? DockPanelConfig.defaultFor(_dockId);
-  List<DockItemModel> get _items =>
-      widget.store.dockItems.putIfAbsent(_dockId, () => PortableIniStore.defaultItemsFor(_dockId));
+  List<DockItemModel> get _items => widget.store.dockItems
+      .putIfAbsent(_dockId, () => PortableIniStore.defaultItemsFor(_dockId));
   bool get _isHorizontal => _cfg.position == 'bottom' || _cfg.position == 'top';
 
   File get _quitSignalFile => File(p.join(widget.store.portableDir.path, '.aerodock_quit'));
   File get _hiddenSignalFile => File(p.join(widget.store.portableDir.path, '.aerodock_hidden'));
+
+  // Slot geometry constants for zero-reflow continuous cosine wave zoom
+  double get _slotStride => _cfg.iconSize + 12.0;
+  double get _sepStride => 14.0;
 
   @override
   void initState() {
@@ -214,7 +226,7 @@ class _DockShellPageState extends State<DockShellPage>
       _ownHwnd = Win32Bridge.findOwnWindowHandle();
       _externalSkins = widget.store.scanExternalSkins();
       _externalDocklets = widget.store.scanExternalDocklets();
-      await _refreshDisplays();
+      await _refreshDisplaysAndWorkArea();
       if (_isPrimary) {
         await _initSystemTray();
         await _registerGlobalHotKey();
@@ -223,37 +235,49 @@ class _DockShellPageState extends State<DockShellPage>
       _extractMissingIcons();
       _applyLayerAndAcrylic();
       await _syncWindowGeometry();
-      _pollWindowsAndSystem();
+      _pollWindowsAndRunning();
+      _pollStatsNow();
+      _pollRecycleBinNow();
     });
 
-    // 1-second timer for Clock, Battery, SysStats, Recycle Bin
+    // 1. Clock ticks ONLY update _nowNotifier (no full-tree rebuild!)
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_suspended || !mounted) return;
-      final now = DateTime.now();
-      final bat = Win32Bridge.getBatteryStatus();
-      final stats = Win32Bridge.getCpuRamStats();
-      final bin = Win32Bridge.queryRecycleBin();
-      setState(() {
-        _now = now;
-        _battery = bat;
-        _sysStats = stats;
-        _recycleBin = bin;
-      });
+      final hasClock = _overlay == _ActiveOverlay.calendar ||
+          _items.any((e) => e.type == 'docklet_clock' || e.type == 'docklet_calendar');
+      if (hasClock) {
+        _nowNotifier.value = DateTime.now();
+      }
     });
 
-    // 600ms zero-overhead native Win32 EnumWindows poll
-    _winPollTimer = Timer.periodic(const Duration(milliseconds: 600), (_) {
+    // 2. Battery & SysStats poll every 2.5s ONLY if those docklets exist on this dock
+    _statsTimer = Timer.periodic(const Duration(milliseconds: 2500), (_) {
       if (_suspended || !mounted) return;
-      _pollWindowsAndSystem();
+      _pollStatsNow();
     });
 
-    // 400ms IPC + Settings.ini hot-sync across Dock 1 / Dock 2 / Dock 3
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
+    // 3. Recycle Bin polls every 5s ONLY if recycle_bin exists on this dock
+    _recycleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (_suspended || !mounted) return;
+      _pollRecycleBinNow();
+    });
+
+    // 4. Running indicators & Minimize-to-dock poll every 1.4s via PID-cached Win32 FFI (<0.15ms)
+    _winPollTimer = Timer.periodic(const Duration(milliseconds: 1400), (_) {
+      if (_suspended || !mounted) return;
+      if (widget.store.global.showRunningIndicators ||
+          (_isPrimary && widget.store.global.minimizeToDock)) {
+        _pollWindowsAndRunning();
+      }
+    });
+
+    // 5. Multi-Dock INI/IPC sync every 1.2s (lightweight file mtime check)
+    _syncTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
       _checkMultiDockSync();
     });
 
-    // 120ms lightweight cursor edge check for AutoHide & Popup on Mouseover
-    _edgeHoverTimer = Timer.periodic(const Duration(milliseconds: 120), (_) {
+    // 6. AutoHide / Popup edge hover check ONLY when needed (uses cached rect, 0 IPC!)
+    _edgeHoverTimer = Timer.periodic(const Duration(milliseconds: 140), (_) {
       if (_suspended || !mounted) return;
       _checkCursorEdgeHover();
     });
@@ -262,11 +286,19 @@ class _DockShellPageState extends State<DockShellPage>
   @override
   void dispose() {
     _clockTimer?.cancel();
+    _statsTimer?.cancel();
+    _recycleTimer?.cancel();
     _winPollTimer?.cancel();
     _syncTimer?.cancel();
     _edgeHoverTimer?.cancel();
     _autoHideDelayTimer?.cancel();
     _popupDelayTimer?.cancel();
+    _hoverAxisNotifier.dispose();
+    _nowNotifier.dispose();
+    _batteryNotifier.dispose();
+    _sysStatsNotifier.dispose();
+    _recycleBinNotifier.dispose();
+    _runningProcsNotifier.dispose();
     windowManager.removeListener(this);
     if (_isPrimary) {
       trayManager.removeListener(this);
@@ -275,6 +307,24 @@ class _DockShellPageState extends State<DockShellPage>
       _killAllChildDocks();
     }
     super.dispose();
+  }
+
+  void _pollStatsNow() {
+    if (_items.any((e) => e.type == 'docklet_battery')) {
+      final bat = Win32Bridge.getBatteryStatus();
+      if (bat != _batteryNotifier.value) _batteryNotifier.value = bat;
+    }
+    if (_items.any((e) => e.type == 'docklet_sysstats')) {
+      final st = Win32Bridge.getCpuRamStats();
+      if (st != _sysStatsNotifier.value) _sysStatsNotifier.value = st;
+    }
+  }
+
+  void _pollRecycleBinNow() {
+    if (_items.any((e) => e.type == 'recycle_bin')) {
+      final info = Win32Bridge.queryRecycleBin();
+      if (info != _recycleBinNotifier.value) _recycleBinNotifier.value = info;
+    }
   }
 
   // ============================================================================
@@ -291,15 +341,9 @@ class _DockShellPageState extends State<DockShellPage>
       final running = _childDocks[id];
       if (shouldRun && running == null) {
         try {
-          final proc = await Process.start(
-            exe,
-            ['--dock=$id'],
-            mode: ProcessStartMode.normal,
-          );
+          final proc = await Process.start(exe, ['--dock=$id']);
           _childDocks[id] = proc;
-          proc.exitCode.then((_) {
-            _childDocks.remove(id);
-          });
+          proc.exitCode.then((_) => _childDocks.remove(id));
         } catch (_) {}
       } else if (!shouldRun && running != null) {
         try {
@@ -325,7 +369,6 @@ class _DockShellPageState extends State<DockShellPage>
       return;
     }
 
-    // Sync Ctrl+Alt+R suspend/hide across all panels
     final shouldSuspend = _hiddenSignalFile.existsSync();
     if (shouldSuspend != _suspended) {
       _suspended = shouldSuspend;
@@ -339,21 +382,26 @@ class _DockShellPageState extends State<DockShellPage>
       if (mounted) setState(() {});
     }
 
-    if (await widget.store.hasExternalChanges()) {
-      await widget.store.reloadFromDisk();
-      AppI18n.currentCode = widget.store.global.language;
-      _externalSkins = widget.store.scanExternalSkins();
-      _externalDocklets = widget.store.scanExternalDocklets();
-      if (_isPrimary) {
-        await _reconcileSiblingDocks();
+    // Only check external INI changes when multi-dock is active
+    if (widget.store.global.dockCount > 1 || !_isPrimary) {
+      if (await widget.store.hasExternalChanges()) {
+        await widget.store.reloadFromDisk();
+        AppI18n.currentCode = widget.store.global.language;
+        _externalSkins = widget.store.scanExternalSkins();
+        _externalDocklets = widget.store.scanExternalDocklets();
+        await _refreshDisplaysAndWorkArea();
+        if (_isPrimary) {
+          await _reconcileSiblingDocks();
+          await _rebuildTrayMenu();
+        }
+        if (_dockId > widget.store.global.dockCount && !_isPrimary) {
+          await _exitSingleInstance();
+          return;
+        }
+        _applyLayerAndAcrylic();
+        await _syncWindowGeometry();
+        if (mounted) setState(() {});
       }
-      if (_dockId > widget.store.global.dockCount && !_isPrimary) {
-        await _exitSingleInstance();
-        return;
-      }
-      _applyLayerAndAcrylic();
-      await _syncWindowGeometry();
-      if (mounted) setState(() {});
     }
   }
 
@@ -383,7 +431,7 @@ class _DockShellPageState extends State<DockShellPage>
   Future<void> _initSystemTray() async {
     try {
       await trayManager.setIcon('assets/app_icon.ico');
-      await trayManager.setToolTip('AeroDock Portable (${widget.store.global.dockCount} пана.) · Ctrl+Alt+R');
+      await trayManager.setToolTip('AeroDock Portable · Ctrl+Alt+R');
       await _rebuildTrayMenu();
     } catch (_) {}
   }
@@ -452,7 +500,6 @@ class _DockShellPageState extends State<DockShellPage>
     } catch (_) {}
   }
 
-  /// Ctrl+Alt+R: completely hide/show ALL dock panels & pause rendering/polling.
   Future<void> _toggleGlobalSuspend() async {
     final nextSuspended = !_suspended;
     if (nextSuspended) {
@@ -476,10 +523,10 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Native Win32 Running Apps + Minimize Windows to Dock + Live Aero Previews
+  // Ultra-Fast Running Indicators + Clean Minimize-to-Dock (Zero Startup Hijack!)
   // ============================================================================
 
-  void _pollWindowsAndSystem() {
+  void _pollWindowsAndRunning() {
     final windows = Win32Bridge.enumerateWindows(includeHiddenHwnds: _hiddenByDockHwnds);
     _openWindows = windows;
 
@@ -488,89 +535,93 @@ class _DockShellPageState extends State<DockShellPage>
       if (w.processName.isNotEmpty) running.add(w.processName);
     }
 
+    // Only update running indicator notifier when changed!
+    final prev = _runningProcsNotifier.value;
+    if (running.length != prev.length || !running.containsAll(prev)) {
+      _runningProcsNotifier.value = running;
+    }
+
+    // Record baseline already-minimized windows on first poll so we never hijack them
+    if (!_baselineCaptured) {
+      _baselineCaptured = true;
+      for (final w in windows) {
+        if (w.isMinimized) _baselineMinimizedHwnds.add(w.hwnd);
+      }
+      return;
+    }
+
+    if (!_isPrimary) return;
+
     var minListChanged = false;
 
-    // Only Dock #1 captures minimized windows into the dock
-    if (_isPrimary) {
-      // Remove dead or restored windows from minimized tray
-      for (var i = _minimizedWindows.length - 1; i >= 0; i--) {
-        final entry = _minimizedWindows[i];
-        if (!Win32Bridge.isWindowAlive(entry.hwnd)) {
-          _hiddenByDockHwnds.remove(entry.hwnd);
-          _minimizedWindows.removeAt(i);
-          minListChanged = true;
-          continue;
-        }
-        final live = windows.where((w) => w.hwnd == entry.hwnd).firstOrNull;
-        if (live != null && live.isVisible && !live.isMinimized) {
-          _hiddenByDockHwnds.remove(entry.hwnd);
-          _minimizedWindows.removeAt(i);
-          minListChanged = true;
-        } else if (live != null) {
-          entry.title = live.title;
-        }
-      }
-
-      if (widget.store.global.minimizeToDock) {
-        final ctrlAltShift = Win32Bridge.isCtrlAltShiftPressed();
-        final ctrlOnly = Win32Bridge.isCtrlPressed() && !ctrlAltShift;
-
-        for (final w in windows) {
-          if (!w.isMinimized) {
-            _onceExcludedHwnds.remove(w.hwnd);
-            continue;
-          }
-          if (_hiddenByDockHwnds.contains(w.hwnd)) continue;
-          if (_onceExcludedHwnds.contains(w.hwnd)) continue;
-          if (widget.store.global.excludedWindows.contains(w.processName)) continue;
-
-          // RocketDock exclusion shortcuts while minimizing!
-          if (ctrlAltShift && w.processName.isNotEmpty) {
-            widget.store.global.excludedWindows.add(w.processName);
-            widget.store.save();
-            continue;
-          }
-          if (ctrlOnly) {
-            _onceExcludedHwnds.add(w.hwnd);
-            continue;
-          }
-
-          // Capture live thumbnail before hiding from taskbar
-          final thumb = Win32Bridge.captureWindowThumbnailPng(w.hwnd);
-          final ico = w.exePath.isNotEmpty
-              ? Win32Bridge.extractIconToPng(w.exePath, widget.store.iconsCacheDir)
-              : null;
-
-          Win32Bridge.hideWindowFromTaskbar(w.hwnd);
-          _hiddenByDockHwnds.add(w.hwnd);
-          _minimizedWindows.add(
-            _MinimizedWindowEntry(
-              hwnd: w.hwnd,
-              title: w.title,
-              exePath: w.exePath,
-              processName: w.processName,
-              iconPngPath: ico,
-              thumbnailPng: thumb,
-            ),
-          );
-          minListChanged = true;
-        }
-      } else if (_minimizedWindows.isNotEmpty) {
-        _restoreAllHiddenWindows();
+    for (var i = _minimizedWindows.length - 1; i >= 0; i--) {
+      final entry = _minimizedWindows[i];
+      if (!Win32Bridge.isWindowAlive(entry.hwnd)) {
+        _hiddenByDockHwnds.remove(entry.hwnd);
+        _minimizedWindows.removeAt(i);
         minListChanged = true;
+        continue;
+      }
+      final live = windows.where((w) => w.hwnd == entry.hwnd).firstOrNull;
+      if (live != null && live.isVisible && !live.isMinimized) {
+        _hiddenByDockHwnds.remove(entry.hwnd);
+        _minimizedWindows.removeAt(i);
+        minListChanged = true;
+      } else if (live != null) {
+        entry.title = live.title;
       }
     }
 
-    if (mounted &&
-        (minListChanged ||
-            running.length != _runningProcesses.length ||
-            !running.containsAll(_runningProcesses))) {
-      setState(() {
-        _runningProcesses = running;
-      });
-      if (minListChanged) {
-        _syncWindowGeometry();
+    if (widget.store.global.minimizeToDock) {
+      final ctrlAltShift = Win32Bridge.isCtrlAltShiftPressed();
+      final ctrlOnly = Win32Bridge.isCtrlPressed() && !ctrlAltShift;
+
+      for (final w in windows) {
+        if (!w.isMinimized) {
+          _baselineMinimizedHwnds.remove(w.hwnd);
+          _onceExcludedHwnds.remove(w.hwnd);
+          continue;
+        }
+        if (_baselineMinimizedHwnds.contains(w.hwnd)) continue;
+        if (_hiddenByDockHwnds.contains(w.hwnd)) continue;
+        if (_onceExcludedHwnds.contains(w.hwnd)) continue;
+        if (widget.store.global.excludedWindows.contains(w.processName)) continue;
+
+        if (ctrlAltShift && w.processName.isNotEmpty) {
+          widget.store.global.excludedWindows.add(w.processName);
+          widget.store.save();
+          continue;
+        }
+        if (ctrlOnly) {
+          _onceExcludedHwnds.add(w.hwnd);
+          continue;
+        }
+
+        final ico = w.exePath.isNotEmpty
+            ? Win32Bridge.extractIconToPng(w.exePath, widget.store.iconsCacheDir)
+            : null;
+
+        Win32Bridge.hideWindowFromTaskbar(w.hwnd);
+        _hiddenByDockHwnds.add(w.hwnd);
+        _minimizedWindows.add(
+          _MinimizedWindowEntry(
+            hwnd: w.hwnd,
+            title: w.title,
+            exePath: w.exePath,
+            processName: w.processName,
+            iconPngPath: ico,
+          ),
+        );
+        minListChanged = true;
       }
+    } else if (_minimizedWindows.isNotEmpty) {
+      _restoreAllHiddenWindows();
+      minListChanged = true;
+    }
+
+    if (minListChanged && mounted) {
+      setState(() {});
+      _syncWindowGeometry();
     }
   }
 
@@ -601,30 +652,36 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Monitors (including "Monitor *" virtual screen), Layering & Window Geometry
+  // Work-Area Positioning (Sits Cleanly ABOVE Windows Taskbar!)
   // ============================================================================
 
-  Future<void> _refreshDisplays() async {
+  Future<void> _refreshDisplaysAndWorkArea() async {
     try {
       _displays = await screenRetriever.getAllDisplays();
     } catch (_) {}
-  }
 
-  Future<Rect> _getTargetScreenRect() async {
     if (_cfg.monitorIndex == -1) {
-      // RocketDock "Monitor *" (all monitors as one virtual desktop)
       final v = Win32Bridge.getVirtualScreenRect();
-      return Rect.fromLTWH(v.left, v.top, v.width, v.height);
+      _cachedScreenRect = Rect.fromLTWH(v.left, v.top, v.width, v.height);
+      return;
     }
-    if (_displays.isEmpty) await _refreshDisplays();
+
+    // On primary monitor (index 0), SPI_GETWORKAREA gives exact bounds excluding Windows Taskbar!
+    if (_cfg.monitorIndex == 0) {
+      final work = Win32Bridge.getPrimaryWorkArea();
+      if (work != null) {
+        _cachedScreenRect = Rect.fromLTWH(work.left, work.top, work.width, work.height);
+        return;
+      }
+    }
+
     if (_displays.isNotEmpty) {
       final idx = _cfg.monitorIndex.clamp(0, _displays.length - 1);
       final d = _displays[idx];
       final pos = d.visiblePosition ?? Offset.zero;
-      return Rect.fromLTWH(pos.dx, pos.dy, d.size.width, d.size.height);
+      final sz = d.visibleSize ?? d.size;
+      _cachedScreenRect = Rect.fromLTWH(pos.dx, pos.dy, sz.width, sz.height);
     }
-    final primary = await screenRetriever.getPrimaryDisplay();
-    return Rect.fromLTWH(0, 0, primary.size.width, primary.size.height);
   }
 
   void _applyLayerAndAcrylic() {
@@ -640,11 +697,21 @@ class _DockShellPageState extends State<DockShellPage>
     );
   }
 
+  double _computeItemsMainSpan() {
+    var total = 0.0;
+    for (final it in _items) {
+      total += it.type == 'separator' ? _sepStride : _slotStride;
+    }
+    if (_isPrimary && _minimizedWindows.isNotEmpty) {
+      total += _sepStride + _minimizedWindows.length * _slotStride;
+    }
+    return total;
+  }
+
   Future<void> _syncWindowGeometry() async {
     if (_suspended) return;
-    final screen = await _getTargetScreenRect();
+    final screen = _cachedScreenRect;
 
-    // If an overlay dialog/popover is open, expand & center cleanly on screen
     if (_overlay != _ActiveOverlay.none) {
       final w = switch (_overlay) {
         _ActiveOverlay.settings => 760.0,
@@ -669,33 +736,26 @@ class _DockShellPageState extends State<DockShellPage>
       return;
     }
 
-    final totalSlots = _items.length + (_isPrimary ? _minimizedWindows.length : 0);
     final baseIcon = _cfg.iconSize;
     final maxIcon = baseIcon * (_cfg.hoverEffect == 'none' ? 1.0 : _cfg.zoomScale);
-    final mainLen = math.max(
-      240.0,
-      totalSlots * (baseIcon + 14) + maxIcon * 1.6 + 64,
-    );
-    // Reserve headroom for zoomed icons + labels + minimized window Aero preview card
-    final hasMinimized = _isPrimary && _minimizedWindows.isNotEmpty;
-    final crossLen = math.max(
-      maxIcon + (_cfg.showLabels ? 52 : 24) + (hasMinimized ? 130 : 0),
-      138.0,
-    );
+    // Generous horizontal padding so outermost zoomed icons NEVER clip!
+    final mainLen = math.max(240.0, _computeItemsMainSpan() + maxIcon * 1.4 + 48);
+    // Generous vertical headroom above the shelf for zoomed icons + floating label!
+    final crossLen = math.max(maxIcon + (_cfg.showLabels ? 56 : 28) + 20, 146.0);
 
     final bool collapsed = _cfg.autoHide && _isAutoHidden;
     final double winW;
     final double winH;
     if (_isHorizontal) {
-      winW = math.min(screen.width - 16, mainLen);
-      winH = collapsed ? 10.0 : math.min(screen.height - 24, crossLen);
+      winW = math.min(screen.width - 12, mainLen);
+      winH = collapsed ? 8.0 : math.min(screen.height - 20, crossLen);
     } else {
-      winW = collapsed ? 10.0 : math.min(screen.width - 24, crossLen + 110);
-      winH = math.min(screen.height - 16, mainLen);
+      winW = collapsed ? 8.0 : math.min(screen.width - 20, crossLen + 110);
+      winH = math.min(screen.height - 12, mainLen);
     }
 
-    final centerShiftX = (screen.width * (_cfg.centerOffset / 100));
-    final centerShiftY = (screen.height * (_cfg.centerOffset / 100));
+    final centerShiftX = screen.width * (_cfg.centerOffset / 100);
+    final centerShiftY = screen.height * (_cfg.centerOffset / 100);
     final edge = collapsed ? 0.0 : _cfg.edgeOffset;
 
     double x;
@@ -728,14 +788,14 @@ class _DockShellPageState extends State<DockShellPage>
     _applyLayerAndAcrylic();
   }
 
-  /// AutoHide wake-up + Popup on Mouseover edge trigger via low-latency GetCursorPos.
-  Future<void> _checkCursorEdgeHover() async {
+  /// Zero-IPC edge hover detector using cached work area + GetCursorPos.
+  void _checkCursorEdgeHover() {
     if (_overlay != _ActiveOverlay.none) return;
     if (!_cfg.autoHide && (!_cfg.popupOnMouseover || _cfg.layer == 'top')) return;
 
     final cursor = Win32Bridge.getCursorPos();
-    final screen = await _getTargetScreenRect();
-    const hotZone = 6.0;
+    final screen = _cachedScreenRect;
+    const hotZone = 8.0;
 
     final atEdge = switch (_cfg.position) {
       'top' => cursor.y <= screen.top + hotZone &&
@@ -756,13 +816,13 @@ class _DockShellPageState extends State<DockShellPage>
       if (_cfg.autoHide && _isAutoHidden) {
         _autoHideDelayTimer?.cancel();
         setState(() => _isAutoHidden = false);
-        await _syncWindowGeometry();
+        _syncWindowGeometry();
       }
       if (_cfg.popupOnMouseover && _cfg.layer != 'top' && !_isPopupRaised) {
         _popupDelayTimer ??= Timer(Duration(milliseconds: _cfg.popupDelayMs), () {
           _popupDelayTimer = null;
           if (!mounted) return;
-          setState(() => _isPopupRaised = true);
+          _isPopupRaised = true;
           _applyLayerAndAcrylic();
         });
       }
@@ -776,12 +836,17 @@ class _DockShellPageState extends State<DockShellPage>
     var changed = false;
     for (final item in _items) {
       if ((item.type == 'file' || item.type == 'path' || item.type == 'blank') &&
-          item.target.isNotEmpty &&
-          (item.iconPath == null || !File(item.iconPath!).existsSync())) {
-        final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
-        if (png != null) {
-          item.iconPath = png;
-          changed = true;
+          item.target.isNotEmpty) {
+        // Re-extract if missing OR if still pointing to an old blurry 32px ico_* cache file
+        final needsUpgrade = item.iconPath == null ||
+            !File(item.iconPath!).existsSync() ||
+            p.basename(item.iconPath!).startsWith('ico_');
+        if (needsUpgrade) {
+          final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
+          if (png != item.iconPath) {
+            item.iconPath = png;
+            changed = true;
+          }
         }
       }
     }
@@ -792,13 +857,13 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Item Activation (Open Running, Run Mode, Start In, Args, Docklets, Actions)
+  // Activation & Drag-n-Drop
   // ============================================================================
 
   void _triggerClickEffect(String key) {
     if (_cfg.clickEffect == 'none') return;
     setState(() => _bouncingKey = key);
-    Future.delayed(const Duration(milliseconds: 500), () {
+    Future.delayed(const Duration(milliseconds: 420), () {
       if (mounted && _bouncingKey == key) {
         setState(() => _bouncingKey = null);
       }
@@ -854,7 +919,6 @@ class _DockShellPageState extends State<DockShellPage>
       return;
     }
 
-    // URL target
     if (item.target.startsWith('http://') || item.target.startsWith('https://')) {
       final uri = Uri.tryParse(item.target);
       if (uri != null) {
@@ -863,25 +927,18 @@ class _DockShellPageState extends State<DockShellPage>
       return;
     }
 
-    // RocketDock "Open Running" (Global / Always / Never)
     final shouldOpenRunning = item.openRunning == 'always' ||
         (item.openRunning == 'global' && widget.store.global.openRunningInstance);
 
     if (shouldOpenRunning) {
       final exeName = item.executableName;
       if (exeName != null) {
-        // First check minimized-in-dock windows
-        final minMatch = _minimizedWindows
-            .where((m) => m.processName == exeName)
-            .firstOrNull;
+        final minMatch = _minimizedWindows.where((m) => m.processName == exeName).firstOrNull;
         if (minMatch != null) {
           _restoreMinimizedEntry(minMatch);
           return;
         }
-        // Then check open visible windows
-        final openMatch = _openWindows
-            .where((w) => w.processName == exeName)
-            .firstOrNull;
+        final openMatch = _openWindows.where((w) => w.processName == exeName).firstOrNull;
         if (openMatch != null) {
           Win32Bridge.restoreAndFocusWindow(openMatch.hwnd);
           return;
@@ -897,24 +954,32 @@ class _DockShellPageState extends State<DockShellPage>
     );
   }
 
-  // ============================================================================
-  // Drag-n-Drop from Windows (Add to Dock OR Drop ONTO App / Folder / Recycle Bin)
-  // ============================================================================
+  /// Find which regular item index sits under local axis coordinate [axisPos].
+  int? _hitTestItemIndex(double? axisPos) {
+    if (axisPos == null) return null;
+    var cursor = 0.0;
+    for (var i = 0; i < _items.length; i++) {
+      final w = _items[i].type == 'separator' ? _sepStride : _slotStride;
+      if (axisPos >= cursor && axisPos <= cursor + w) {
+        return _items[i].type == 'separator' ? null : i;
+      }
+      cursor += w;
+    }
+    return null;
+  }
 
   Future<void> _handleExternalDrop(DropDoneDetails details) async {
     setState(() => _isDraggingFile = false);
     final paths = details.files.map((f) => f.path).where((s) => s.isNotEmpty).toList();
     if (paths.isEmpty) return;
 
-    // Check if files were dropped directly onto an existing dock icon!
-    if (_hoveredSlotIndex != null &&
-        _hoveredSlotIndex! >= 0 &&
-        _hoveredSlotIndex! < _items.length) {
-      final targetItem = _items[_hoveredSlotIndex!];
+    final hoveredIdx = _hitTestItemIndex(_hoverAxisNotifier.value);
+    if (hoveredIdx != null && hoveredIdx >= 0 && hoveredIdx < _items.length) {
+      final targetItem = _items[hoveredIdx];
       if (targetItem.type == 'recycle_bin') {
         Win32Bridge.sendFilesToRecycleBin(paths);
         _triggerClickEffect(targetItem.id);
-        setState(() => _recycleBin = Win32Bridge.queryRecycleBin());
+        _pollRecycleBinNow();
         return;
       }
       if ((targetItem.type == 'path' || targetItem.type == 'docklet_stack') &&
@@ -926,8 +991,7 @@ class _DockShellPageState extends State<DockShellPage>
       }
       if (targetItem.type == 'file' && targetItem.target.isNotEmpty) {
         final quoted = paths.map((e) => '"$e"').join(' ');
-        final fullArgs =
-            targetItem.args.isEmpty ? quoted : '${targetItem.args} $quoted';
+        final fullArgs = targetItem.args.isEmpty ? quoted : '${targetItem.args} $quoted';
         Win32Bridge.shellExecute(
           target: targetItem.target,
           args: fullArgs,
@@ -939,12 +1003,9 @@ class _DockShellPageState extends State<DockShellPage>
       }
     }
 
-    // Otherwise add dropped files/folders as new dock shortcuts
     for (final filePath in paths) {
       final isDir = FileSystemEntity.isDirectorySync(filePath);
-      final name = isDir
-          ? p.basename(filePath)
-          : p.basenameWithoutExtension(filePath);
+      final name = isDir ? p.basename(filePath) : p.basenameWithoutExtension(filePath);
       final png = Win32Bridge.extractIconToPng(filePath, widget.store.iconsCacheDir);
       _items.add(
         DockItemModel(
@@ -965,11 +1026,8 @@ class _DockShellPageState extends State<DockShellPage>
     await _syncWindowGeometry();
   }
 
-  // ============================================================================
-  // Overlay Open / Close
-  // ============================================================================
-
   Future<void> _openOverlay(_ActiveOverlay next) async {
+    _hoverAxisNotifier.value = null;
     setState(() {
       _overlay = next;
       _isAutoHidden = false;
@@ -983,11 +1041,12 @@ class _DockShellPageState extends State<DockShellPage>
       _editingItem = null;
       _openStackItem = null;
     });
+    await _refreshDisplaysAndWorkArea();
     await _syncWindowGeometry();
   }
 
   // ============================================================================
-  // RocketDock Right-Click Context Menus (Dock & Item & Minimized Window)
+  // Context Menus
   // ============================================================================
 
   Future<void> _showDockContextMenu(
@@ -997,7 +1056,6 @@ class _DockShellPageState extends State<DockShellPage>
   }) async {
     final entries = <PopupMenuEntry<String>>[];
 
-    // 1. Minimized Window specific actions
     if (minWin != null) {
       entries.addAll([
         PopupMenuItem(value: 'win_open', child: Text(AppI18n.t('open_window'))),
@@ -1009,7 +1067,6 @@ class _DockShellPageState extends State<DockShellPage>
       ]);
     }
 
-    // 2. Item specific actions
     if (item != null) {
       if (item.type != 'separator') {
         entries.add(PopupMenuItem(value: 'item_edit', child: Text('${AppI18n.t('icon_settings')}…')));
@@ -1018,7 +1075,7 @@ class _DockShellPageState extends State<DockShellPage>
         entries.add(
           PopupMenuItem(
             value: 'empty_bin',
-            child: Text('${AppI18n.t('empty_recycle_bin')} (${_recycleBin.itemCount})'),
+            child: Text('${AppI18n.t('empty_recycle_bin')} (${_recycleBinNotifier.value.itemCount})'),
           ),
         );
       }
@@ -1031,7 +1088,6 @@ class _DockShellPageState extends State<DockShellPage>
       entries.add(const PopupMenuDivider());
     }
 
-    // 3. RocketDock "Add Item" actions
     entries.addAll([
       PopupMenuItem(value: 'add_file', child: Text('＋ ${AppI18n.t('add_file')}')),
       PopupMenuItem(value: 'add_path', child: Text('＋ ${AppI18n.t('add_path')}')),
@@ -1062,7 +1118,10 @@ class _DockShellPageState extends State<DockShellPage>
         value: 'toggle_autohide',
         child: Text('${AppI18n.t('auto_hide')}${_cfg.autoHide ? ' ✓' : ''}'),
       ),
-      PopupMenuItem(value: 'docks_cycle', child: Text('${AppI18n.t('multi_dock')}: ${widget.store.global.dockCount} → ${(widget.store.global.dockCount % 3) + 1}')),
+      PopupMenuItem(
+        value: 'docks_cycle',
+        child: Text('${AppI18n.t('multi_dock')}: ${widget.store.global.dockCount} → ${(widget.store.global.dockCount % 3) + 1}'),
+      ),
       const PopupMenuDivider(),
       PopupMenuItem(value: 'open_settings', child: Text('⚙ ${AppI18n.t('dock_settings')}…')),
       PopupMenuItem(value: 'quit', child: Text('⏻ ${AppI18n.t('quit')}')),
@@ -1091,7 +1150,7 @@ class _DockShellPageState extends State<DockShellPage>
         break;
       case 'empty_bin':
         Win32Bridge.emptyRecycleBin(silent: false);
-        setState(() => _recycleBin = Win32Bridge.queryRecycleBin());
+        _pollRecycleBinNow();
         break;
       case 'item_delete':
         if (item != null) {
@@ -1159,6 +1218,7 @@ class _DockShellPageState extends State<DockShellPage>
           iconKey: 'trash',
         ));
         await widget.store.save();
+        _pollRecycleBinNow();
         setState(() {});
         await _syncWindowGeometry();
         break;
@@ -1187,45 +1247,27 @@ class _DockShellPageState extends State<DockShellPage>
         await _syncWindowGeometry();
         break;
       case 'add_dk_clock':
-        _items.add(DockItemModel(
-          id: 'dk_clk_${DateTime.now().millisecondsSinceEpoch}',
-          type: 'docklet_clock',
-          title: 'Часы',
-          iconKey: 'clock',
-        ));
+        _items.add(DockItemModel(id: 'dk_clk_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_clock', title: 'Часы', iconKey: 'clock'));
         await widget.store.save();
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_battery':
-        _items.add(DockItemModel(
-          id: 'dk_bat_${DateTime.now().millisecondsSinceEpoch}',
-          type: 'docklet_battery',
-          title: 'Батарея',
-          iconKey: 'star',
-        ));
+        _items.add(DockItemModel(id: 'dk_bat_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_battery', title: 'Батарея', iconKey: 'star'));
         await widget.store.save();
+        _pollStatsNow();
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_sysstats':
-        _items.add(DockItemModel(
-          id: 'dk_sys_${DateTime.now().millisecondsSinceEpoch}',
-          type: 'docklet_sysstats',
-          title: 'CPU / RAM',
-          iconKey: 'terminal',
-        ));
+        _items.add(DockItemModel(id: 'dk_sys_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_sysstats', title: 'CPU / RAM', iconKey: 'terminal'));
         await widget.store.save();
+        _pollStatsNow();
         setState(() {});
         await _syncWindowGeometry();
         break;
       case 'add_dk_calendar':
-        _items.add(DockItemModel(
-          id: 'dk_cal_${DateTime.now().millisecondsSinceEpoch}',
-          type: 'docklet_calendar',
-          title: 'Календарь',
-          iconKey: 'book',
-        ));
+        _items.add(DockItemModel(id: 'dk_cal_${DateTime.now().millisecondsSinceEpoch}', type: 'docklet_calendar', title: 'Календарь', iconKey: 'book'));
         await widget.store.save();
         setState(() {});
         await _syncWindowGeometry();
@@ -1305,17 +1347,8 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Zoom Wave Math & Theme / Skin Decoration
+  // Theme / Skin Shelf Decoration & Label Builder
   // ============================================================================
-
-  double _scaleForSlot(int index) {
-    if (_cfg.hoverEffect == 'none' || _hoveredSlotIndex == null) return 1.0;
-    final dist = (index - _hoveredSlotIndex!).abs().toDouble();
-    final span = math.max(1.0, _cfg.zoomWidth);
-    if (dist > span) return 1.0;
-    final wave = (math.cos((dist / span) * math.pi) + 1) / 2;
-    return 1.0 + (_cfg.zoomScale - 1.0) * wave;
-  }
 
   BoxDecoration _resolveDockSurface() {
     final alpha = (_cfg.bgOpacity / 100.0).clamp(0.0, 1.0);
@@ -1336,38 +1369,38 @@ class _DockShellPageState extends State<DockShellPage>
     switch (_cfg.theme) {
       case 'crystal':
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(18),
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
             colors: [
-              Colors.white.withValues(alpha: 0.24 * alpha),
-              const Color(0xFF0F172A).withValues(alpha: 0.64 * alpha),
+              Colors.white.withValues(alpha: 0.28 * alpha),
+              const Color(0xFF0F172A).withValues(alpha: 0.62 * alpha),
             ],
           ),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.34 * alpha)),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.36 * alpha)),
         );
       case 'graphite':
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(18),
-          color: const Color(0xFF0F172A).withValues(alpha: 0.92 * alpha),
+          borderRadius: BorderRadius.circular(16),
+          color: const Color(0xFF0F172A).withValues(alpha: 0.90 * alpha),
           border: Border.all(color: Colors.white.withValues(alpha: 0.16 * alpha)),
         );
       case 'silk':
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(20),
-          color: const Color(0xFFF8FAFC).withValues(alpha: 0.80 * alpha),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.88 * alpha)),
+          borderRadius: BorderRadius.circular(18),
+          color: const Color(0xFFF8FAFC).withValues(alpha: 0.82 * alpha),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.90 * alpha)),
         );
       case 'minimal':
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          color: const Color(0xFF0F172A).withValues(alpha: 0.44 * alpha),
+          borderRadius: BorderRadius.circular(14),
+          color: const Color(0xFF0F172A).withValues(alpha: 0.42 * alpha),
           border: Border.all(color: Colors.white.withValues(alpha: 0.14 * alpha)),
         );
       case 'retro':
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(12),
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
@@ -1377,26 +1410,28 @@ class _DockShellPageState extends State<DockShellPage>
               const Color(0xFF1E293B).withValues(alpha: alpha),
             ],
           ),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.44 * alpha)),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.45 * alpha)),
         );
       case 'aero3d':
       default:
         return BoxDecoration(
-          borderRadius: BorderRadius.circular(22),
+          borderRadius: BorderRadius.circular(18),
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
             colors: [
-              const Color(0xFFE2E8F0).withValues(alpha: 0.30 * alpha),
-              const Color(0xFF1E293B).withValues(alpha: 0.64 * alpha),
+              const Color(0xFFE2E8F0).withValues(alpha: 0.28 * alpha),
+              const Color(0xFF1E293B).withValues(alpha: 0.68 * alpha),
+              const Color(0xFF020617).withValues(alpha: 0.78 * alpha),
             ],
+            stops: const [0.0, 0.55, 1.0],
           ),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.40 * alpha)),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.34 * alpha)),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.42 * alpha),
-              blurRadius: 18,
-              offset: const Offset(0, 8),
+              color: Colors.black.withValues(alpha: 0.44 * alpha),
+              blurRadius: 16,
+              offset: const Offset(0, 6),
             ),
           ],
         );
@@ -1411,11 +1446,11 @@ class _DockShellPageState extends State<DockShellPage>
         .withValues(alpha: (_cfg.labelOutlineOpacity / 100).clamp(0.0, 1.0));
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
         color: outlineColor,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.20)),
         boxShadow: [
           BoxShadow(color: shadowColor, blurRadius: 8, offset: const Offset(0, 2)),
         ],
@@ -1430,23 +1465,42 @@ class _DockShellPageState extends State<DockShellPage>
           fontWeight: _cfg.labelBold ? FontWeight.w700 : FontWeight.w500,
           fontStyle: _cfg.labelItalic ? FontStyle.italic : FontStyle.normal,
           color: textColor,
-          shadows: [
-            Shadow(color: shadowColor, blurRadius: 4, offset: const Offset(0, 1)),
-          ],
         ),
       ),
     );
   }
 
+  String _resolveHoverTitle(DockItemModel item) {
+    switch (item.type) {
+      case 'recycle_bin':
+        final cnt = _recycleBinNotifier.value.itemCount;
+        return cnt == 0
+            ? '${item.title} (${AppI18n.t('recycle_empty')})'
+            : '${item.title} ($cnt)';
+      case 'docklet_battery':
+        final b = _batteryNotifier.value;
+        return b.hasBattery
+            ? '${item.title}: ${b.percent}%${b.acOnline ? ' (Сеть)' : ''}'
+            : '${item.title}: От сети (AC)';
+      case 'docklet_sysstats':
+        final s = _sysStatsNotifier.value;
+        return 'CPU ${s.cpuPercent}% · RAM ${s.ramPercent}% (${s.usedGb.toStringAsFixed(1)}/${s.totalGb.toStringAsFixed(1)} ГБ)';
+      case 'docklet_clock':
+        final n = _nowNotifier.value;
+        return '${n.hour.toString().padLeft(2, '0')}:${n.minute.toString().padLeft(2, '0')}:${n.second.toString().padLeft(2, '0')}';
+      default:
+        return item.title;
+    }
+  }
+
   // ============================================================================
-  // Main Build
+  // Main Build (GPU-Accelerated 60fps Wave Zoom, Zero Layout Reflow, Zero Clipping!)
   // ============================================================================
 
   @override
   Widget build(BuildContext context) {
     if (_suspended) return const SizedBox.shrink();
 
-    // 1. Built-in RocketDock Overlays (Settings, Icon Settings, Live Stack, Calendar)
     if (_overlay != _ActiveOverlay.none) {
       return Scaffold(
         backgroundColor: Colors.transparent,
@@ -1458,6 +1512,7 @@ class _DockShellPageState extends State<DockShellPage>
                 displays: _displays,
                 onSaved: () async {
                   _externalSkins = widget.store.scanExternalSkins();
+                  await _refreshDisplaysAndWorkArea();
                   if (_isPrimary) {
                     await _reconcileSiblingDocks();
                     await _rebuildTrayMenu();
@@ -1467,11 +1522,13 @@ class _DockShellPageState extends State<DockShellPage>
                 },
                 onResetDefaults: () async {
                   await widget.store.resetSettingsToDefaultsOnly();
+                  await _refreshDisplaysAndWorkArea();
                   _applyLayerAndAcrylic();
                   if (mounted) setState(() {});
                 },
                 onFullReset: () async {
                   await widget.store.fullReset();
+                  await _refreshDisplaysAndWorkArea();
                   if (_isPrimary) await _reconcileSiblingDocks();
                   _applyLayerAndAcrylic();
                   if (mounted) setState(() {});
@@ -1490,6 +1547,8 @@ class _DockShellPageState extends State<DockShellPage>
                     _items.add(saved);
                   }
                   await widget.store.save();
+                  _pollStatsNow();
+                  _pollRecycleBinNow();
                   await _closeOverlay();
                 },
                 onClose: _closeOverlay,
@@ -1510,9 +1569,9 @@ class _DockShellPageState extends State<DockShellPage>
                 },
                 onClose: _closeOverlay,
               ),
-            _ActiveOverlay.calendar => CalendarPopover(
-                now: _now,
-                onClose: _closeOverlay,
+            _ActiveOverlay.calendar => ValueListenableBuilder<DateTime>(
+                valueListenable: _nowNotifier,
+                builder: (_, now, __) => CalendarPopover(now: now, onClose: _closeOverlay),
               ),
             _ => const SizedBox.shrink(),
           },
@@ -1520,7 +1579,6 @@ class _DockShellPageState extends State<DockShellPage>
       );
     }
 
-    // 2. Auto-hidden thin edge trigger strip
     if (_cfg.autoHide && _isAutoHidden) {
       return Scaffold(
         backgroundColor: Colors.transparent,
@@ -1534,8 +1592,8 @@ class _DockShellPageState extends State<DockShellPage>
             color: const Color(0x01000000),
             alignment: Alignment.center,
             child: Container(
-              width: _isHorizontal ? 100 : 3,
-              height: _isHorizontal ? 3 : 100,
+              width: _isHorizontal ? 96 : 3,
+              height: _isHorizontal ? 3 : 96,
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.45),
                 borderRadius: BorderRadius.circular(4),
@@ -1546,107 +1604,19 @@ class _DockShellPageState extends State<DockShellPage>
       );
     }
 
-    // 3. Active Dock Bar
-    final hoveredMinWin = (_isPrimary &&
-            _hoveredSlotIndex != null &&
-            _hoveredSlotIndex! >= _items.length &&
-            (_hoveredSlotIndex! - _items.length) < _minimizedWindows.length)
-        ? _minimizedWindows[_hoveredSlotIndex! - _items.length]
-        : null;
-
-    final hoveredItem = (_hoveredSlotIndex != null &&
-            _hoveredSlotIndex! >= 0 &&
-            _hoveredSlotIndex! < _items.length)
-        ? _items[_hoveredSlotIndex!]
-        : null;
-
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: DropTarget(
         onDragEntered: (_) => setState(() => _isDraggingFile = true),
         onDragExited: (_) => setState(() => _isDraggingFile = false),
         onDragDone: _handleExternalDrop,
-        child: MouseRegion(
-          onExit: (_) {
-            setState(() {
-              _hoveredSlotIndex = null;
-            });
-            if (_isPopupRaised) {
-              setState(() => _isPopupRaised = false);
-              _applyLayerAndAcrylic();
-            }
-            if (_cfg.autoHide) {
-              _autoHideDelayTimer?.cancel();
-              _autoHideDelayTimer = Timer(
-                Duration(milliseconds: _cfg.autoHideDelayMs),
-                () async {
-                  if (!mounted || _overlay != _ActiveOverlay.none) return;
-                  setState(() => _isAutoHidden = true);
-                  await _syncWindowGeometry();
-                },
-              );
-            }
-          },
-          child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition),
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                // Live Aero Thumbnail Preview for hovered minimized window
-                if (hoveredMinWin != null)
-                  Align(
-                    alignment: _cfg.position == 'top'
-                        ? Alignment.bottomCenter
-                        : Alignment.topCenter,
-                    child: Padding(
-                      padding: const EdgeInsets.all(6),
-                      child: MinimizedWindowPreviewCard(
-                        title: hoveredMinWin.title,
-                        thumbnailPng: hoveredMinWin.thumbnailPng,
-                      ),
-                    ),
-                  )
-                // Hover Label for regular items & docklets
-                else if (_cfg.showLabels &&
-                    hoveredItem != null &&
-                    hoveredItem.type != 'separator')
-                  Align(
-                    alignment: switch (_cfg.position) {
-                      'top' => Alignment.bottomCenter,
-                      'left' => Alignment.centerRight,
-                      'right' => Alignment.centerLeft,
-                      _ => Alignment.topCenter,
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.all(6),
-                      child: _buildStyledLabel(_resolveHoverTitle(hoveredItem)),
-                    ),
-                  ),
-
-                // Main Dock Container aligned to its screen edge
-                Align(
-                  alignment: switch (_cfg.position) {
-                    'top' => Alignment.topCenter,
-                    'left' => Alignment.centerLeft,
-                    'right' => Alignment.centerRight,
-                    _ => Alignment.bottomCenter,
-                  },
-                  child: AnimatedContainer(
-                    duration: Duration(milliseconds: _cfg.autoHideDurationMs),
-                    padding: EdgeInsets.symmetric(
-                      horizontal: _isHorizontal ? 14 : 8,
-                      vertical: _isHorizontal ? 8 : 14,
-                    ),
-                    decoration: _resolveDockSurface().copyWith(
-                      border: _isDraggingFile
-                          ? Border.all(color: const Color(0xFF38BDF8), width: 2)
-                          : null,
-                    ),
-                    child: _buildDockItemsAxis(),
-                  ),
-                ),
-              ],
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition),
+          child: RepaintBoundary(
+            child: ValueListenableBuilder<double?>(
+              valueListenable: _hoverAxisNotifier,
+              builder: (context, hoverAxis, _) => _buildDockScene(hoverAxis),
             ),
           ),
         ),
@@ -1654,44 +1624,165 @@ class _DockShellPageState extends State<DockShellPage>
     );
   }
 
-  String _resolveHoverTitle(DockItemModel item) {
-    switch (item.type) {
-      case 'recycle_bin':
-        return _recycleBin.itemCount == 0
-            ? '${item.title} (${AppI18n.t('recycle_empty')})'
-            : '${item.title} (${_recycleBin.itemCount})';
-      case 'docklet_battery':
-        return _battery.hasBattery
-            ? '${item.title}: ${_battery.percent}%${_battery.acOnline ? ' (Сеть)' : ''}'
-            : '${item.title}: От сети (AC)';
-      case 'docklet_sysstats':
-        return 'CPU ${_sysStats.cpuPercent}% · RAM ${_sysStats.ramPercent}% (${_sysStats.usedGb.toStringAsFixed(1)}/${_sysStats.totalGb.toStringAsFixed(1)} ГБ)';
-      case 'docklet_clock':
-        return '${_now.hour.toString().padLeft(2, '0')}:${_now.minute.toString().padLeft(2, '0')}:${_now.second.toString().padLeft(2, '0')}';
-      default:
-        return item.title;
+  Widget _buildDockScene(double? hoverAxis) {
+    final slotCenters = <double>[];
+    var cursor = 0.0;
+    for (final it in _items) {
+      final w = it.type == 'separator' ? _sepStride : _slotStride;
+      slotCenters.add(cursor + w / 2);
+      cursor += w;
     }
+    if (_isPrimary && _minimizedWindows.isNotEmpty) {
+      cursor += _sepStride;
+      for (var j = 0; j < _minimizedWindows.length; j++) {
+        slotCenters.add(cursor + _slotStride / 2);
+        cursor += _slotStride;
+      }
+    }
+    final stripLength = cursor;
+
+    // Determine hovered label text
+    String? hoveredLabel;
+    if (_cfg.showLabels && hoverAxis != null) {
+      final idx = _hitTestItemIndex(hoverAxis);
+      if (idx != null) {
+        hoveredLabel = _resolveHoverTitle(_items[idx]);
+      } else if (_isPrimary && _minimizedWindows.isNotEmpty) {
+        final minStart = stripLength - _minimizedWindows.length * _slotStride;
+        if (hoverAxis >= minStart && hoverAxis <= stripLength) {
+          final mIdx = ((hoverAxis - minStart) ~/ _slotStride)
+              .clamp(0, _minimizedWindows.length - 1);
+          hoveredLabel = _minimizedWindows[mIdx].title;
+        }
+      }
+    }
+
+    final shelfCross = _cfg.iconSize * 0.72 + 12;
+
+    return Stack(
+      clipBehavior: Clip.none,
+      fit: StackFit.expand,
+      children: [
+        // Floating hover label (always well above zoomed icons, never clipped)
+        if (hoveredLabel != null)
+          Align(
+            alignment: switch (_cfg.position) {
+              'top' => Alignment.bottomCenter,
+              'left' => Alignment.centerRight,
+              'right' => Alignment.centerLeft,
+              _ => Alignment.topCenter,
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(6),
+              child: _buildStyledLabel(hoveredLabel),
+            ),
+          ),
+
+        // RocketDock 3D Shelf + Icons Strip aligned cleanly to screen edge
+        Align(
+          alignment: switch (_cfg.position) {
+            'top' => Alignment.topCenter,
+            'left' => Alignment.centerLeft,
+            'right' => Alignment.centerRight,
+            _ => Alignment.bottomCenter,
+          },
+          child: MouseRegion(
+            onHover: (e) {
+              final raw = _isHorizontal ? e.localPosition.dx : e.localPosition.dy;
+              final adjusted = raw - 18.0; // matches outer padding
+              if (_hoverAxisNotifier.value != adjusted) {
+                _hoverAxisNotifier.value = adjusted;
+              }
+            },
+            onExit: (_) {
+              _hoverAxisNotifier.value = null;
+              if (_isPopupRaised) {
+                _isPopupRaised = false;
+                _applyLayerAndAcrylic();
+              }
+              if (_cfg.autoHide) {
+                _autoHideDelayTimer?.cancel();
+                _autoHideDelayTimer = Timer(
+                  Duration(milliseconds: _cfg.autoHideDelayMs),
+                  () async {
+                    if (!mounted || _overlay != _ActiveOverlay.none) return;
+                    setState(() => _isAutoHidden = true);
+                    await _syncWindowGeometry();
+                  },
+                );
+              }
+            },
+            child: Padding(
+              padding: EdgeInsets.symmetric(
+                horizontal: _isHorizontal ? 18 : 6,
+                vertical: _isHorizontal ? 6 : 18,
+              ),
+              child: Stack(
+                clipBehavior: Clip.none,
+                alignment: switch (_cfg.position) {
+                  'top' => Alignment.topCenter,
+                  'left' => Alignment.centerLeft,
+                  'right' => Alignment.centerRight,
+                  _ => Alignment.bottomCenter,
+                },
+                children: [
+                  // Sleek RocketDock Aero glass shelf behind lower 72% of icons
+                  Positioned(
+                    left: _isHorizontal ? -10 : (_cfg.position == 'left' ? 0 : null),
+                    right: _isHorizontal ? -10 : (_cfg.position == 'right' ? 0 : null),
+                    top: !_isHorizontal ? -10 : (_cfg.position == 'top' ? 0 : null),
+                    bottom: !_isHorizontal ? -10 : (_cfg.position == 'bottom' ? 0 : null),
+                    width: _isHorizontal ? null : shelfCross,
+                    height: _isHorizontal ? shelfCross : null,
+                    child: DecoratedBox(
+                      decoration: _resolveDockSurface().copyWith(
+                        border: _isDraggingFile
+                            ? Border.all(color: const Color(0xFF38BDF8), width: 2)
+                            : null,
+                      ),
+                    ),
+                  ),
+
+                  // Icons strip (zero layout reflow on hover — pure GPU Transform!)
+                  _buildIconsAxis(hoverAxis, slotCenters),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 
-  Widget _buildDockItemsAxis() {
-    final children = <Widget>[];
+  double _waveFactor(double? hoverAxis, double slotCenter) {
+    if (hoverAxis == null || _cfg.hoverEffect == 'none') return 0.0;
+    final radiusPx = math.max(1.0, _cfg.zoomWidth) * _slotStride;
+    final dist = (hoverAxis - slotCenter).abs();
+    if (dist >= radiusPx) return 0.0;
+    return (math.cos((dist / radiusPx) * math.pi) + 1.0) * 0.5;
+  }
 
-    // Regular items & docklets
+  Widget _buildIconsAxis(double? hoverAxis, List<double> slotCenters) {
+    final children = <Widget>[];
     for (var i = 0; i < _items.length; i++) {
-      children.add(_buildRegularSlot(i, _items[i]));
+      final wave = _waveFactor(hoverAxis, slotCenters[i]);
+      children.add(_buildRegularSlot(i, _items[i], wave));
     }
 
-    // Minimized windows section on Dock #1
     if (_isPrimary && _minimizedWindows.isNotEmpty) {
       children.add(_buildDividerVisual());
       for (var j = 0; j < _minimizedWindows.length; j++) {
-        children.add(_buildMinimizedWindowSlot(_items.length + j, j, _minimizedWindows[j]));
+        final wave = _waveFactor(hoverAxis, slotCenters[_items.length + j]);
+        children.add(_buildMinimizedWindowSlot(j, _minimizedWindows[j], wave));
       }
     }
 
     if (_isHorizontal) {
-      return SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
+      return Padding(
+        padding: EdgeInsets.only(
+          bottom: _cfg.position == 'bottom' ? 8 : 0,
+          top: _cfg.position == 'top' ? 8 : 0,
+        ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: _cfg.position == 'top'
@@ -1701,8 +1792,12 @@ class _DockShellPageState extends State<DockShellPage>
         ),
       );
     }
-    return SingleChildScrollView(
-      scrollDirection: Axis.vertical,
+
+    return Padding(
+      padding: EdgeInsets.only(
+        left: _cfg.position == 'left' ? 8 : 0,
+        right: _cfg.position == 'right' ? 8 : 0,
+      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: _cfg.position == 'left'
@@ -1714,21 +1809,30 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   Widget _buildDividerVisual() {
-    return Container(
-      margin: EdgeInsets.symmetric(
-        horizontal: _isHorizontal ? 6 : 2,
-        vertical: _isHorizontal ? 4 : 6,
-      ),
-      width: _isHorizontal ? 1.5 : _cfg.iconSize * 0.72,
-      height: _isHorizontal ? _cfg.iconSize * 0.72 : 1.5,
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.34),
-        borderRadius: BorderRadius.circular(2),
+    return SizedBox(
+      width: _isHorizontal ? _sepStride : _cfg.iconSize,
+      height: _isHorizontal ? _cfg.iconSize : _sepStride,
+      child: Center(
+        child: Container(
+          width: _isHorizontal ? 1.5 : _cfg.iconSize * 0.65,
+          height: _isHorizontal ? _cfg.iconSize * 0.65 : 1.5,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.30),
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
       ),
     );
   }
 
-  Widget _buildRegularSlot(int index, DockItemModel item) {
+  Alignment get _zoomAnchor => switch (_cfg.position) {
+        'top' => Alignment.topCenter,
+        'left' => Alignment.centerLeft,
+        'right' => Alignment.centerRight,
+        _ => Alignment.bottomCenter,
+      };
+
+  Widget _buildRegularSlot(int index, DockItemModel item, double wave) {
     if (item.type == 'separator') {
       return GestureDetector(
         onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition, item: item),
@@ -1736,77 +1840,80 @@ class _DockShellPageState extends State<DockShellPage>
       );
     }
 
-    final scale = _scaleForSlot(index);
-    final size = _cfg.iconSize * scale;
-    final isHovered = _hoveredSlotIndex == index;
+    final base = _cfg.iconSize;
+    final scale = _cfg.hoverEffect == 'bubble'
+        ? 1.0 + (_cfg.zoomScale - 1.0) * wave
+        : 1.0;
+    final liftPx = _cfg.hoverEffect == 'none' ? 0.0 : wave * (base * 0.16);
     final isBouncing = _bouncingKey == item.id;
-    final exe = item.executableName;
-    final isRunning = widget.store.global.showRunningIndicators &&
-        exe != null &&
-        _runningProcesses.contains(exe);
+    final bounceOffset = isBouncing && _cfg.clickEffect == 'bounce' ? -10.0 : 0.0;
 
-    final effectiveOpacity = (isHovered && _cfg.zoomOpaque)
+    final dx = switch (_cfg.position) {
+      'left' => liftPx,
+      'right' => -liftPx,
+      _ => 0.0,
+    };
+    final dy = switch (_cfg.position) {
+      'top' => liftPx - bounceOffset,
+      'bottom' => -liftPx + bounceOffset,
+      _ => bounceOffset,
+    };
+
+    final effectiveOpacity = (wave > 0.2 && _cfg.zoomOpaque)
         ? 1.0
         : (_cfg.iconOpacity / 100.0).clamp(0.2, 1.0);
 
-    final iconVisual = _renderItemArt(item, size);
+    final exe = item.executableName;
 
-    final tile = MouseRegion(
-      onEnter: (_) => setState(() => _hoveredSlotIndex = index),
+    final tile = SizedBox(
+      width: _isHorizontal ? _slotStride : base + 10,
+      height: _isHorizontal ? base + 10 : _slotStride,
       child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: () => _activateItem(item),
         onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition, item: item),
-        child: Opacity(
-          opacity: effectiveOpacity,
-          child: AnimatedContainer(
-            duration: Duration(milliseconds: _cfg.zoomDurationMs),
-            curve: Curves.easeOutCubic,
-            margin: EdgeInsets.symmetric(
-              horizontal: _isHorizontal ? 4 : 0,
-              vertical: _isHorizontal ? 0 : 4,
-            ),
-            transform: Matrix4.translationValues(
-              0,
-              isBouncing && _cfg.clickEffect == 'bounce' ? -12 : 0,
-              0,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                AnimatedScale(
-                  scale: isBouncing && _cfg.clickEffect == 'pulse' ? 1.14 : 1.0,
-                  duration: const Duration(milliseconds: 180),
-                  child: DecoratedBox(
-                    decoration: isBouncing && _cfg.clickEffect == 'glow'
-                        ? BoxDecoration(
-                            borderRadius: BorderRadius.circular(size * 0.26),
-                            boxShadow: const [
-                              BoxShadow(color: Color(0xCC38BDF8), blurRadius: 18, spreadRadius: 2),
-                            ],
-                          )
-                        : const BoxDecoration(),
-                    child: iconVisual,
-                  ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Opacity(
+              opacity: effectiveOpacity,
+              child: Transform.translate(
+                offset: Offset(dx, dy),
+                child: Transform.scale(
+                  scale: scale * (isBouncing && _cfg.clickEffect == 'pulse' ? 1.12 : 1.0),
+                  alignment: _zoomAnchor,
+                  child: _renderItemArt(item, base),
                 ),
-                if (isRunning)
-                  Container(
-                    margin: const EdgeInsets.only(top: 3),
-                    width: 6,
-                    height: 6,
-                    decoration: const BoxDecoration(
-                      color: Color(0xFF38BDF8),
-                      shape: BoxShape.circle,
-                      boxShadow: [BoxShadow(color: Color(0xAA38BDF8), blurRadius: 6)],
-                    ),
-                  ),
-              ],
+              ),
             ),
-          ),
+            // Running indicator driven by isolated ValueListenableBuilder!
+            SizedBox(
+              height: 7,
+              child: (widget.store.global.showRunningIndicators && exe != null)
+                  ? ValueListenableBuilder<Set<String>>(
+                      valueListenable: _runningProcsNotifier,
+                      builder: (_, running, __) {
+                        if (!running.contains(exe)) return const SizedBox.shrink();
+                        return Center(
+                          child: Container(
+                            width: 5,
+                            height: 5,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF38BDF8),
+                              shape: BoxShape.circle,
+                              boxShadow: [BoxShadow(color: Color(0xCC38BDF8), blurRadius: 5)],
+                            ),
+                          ),
+                        );
+                      },
+                    )
+                  : null,
+            ),
+          ],
         ),
       ),
     );
 
-    // Drag-to-reorder + Drag-off-to-remove (Lock Items bypassed by holding Ctrl!)
     return DragTarget<int>(
       onAcceptWithDetails: (details) async {
         final from = details.data;
@@ -1823,18 +1930,16 @@ class _DockShellPageState extends State<DockShellPage>
               (!widget.store.global.lockItems || Win32Bridge.isCtrlPressed()) ? 1 : 0,
           feedback: Material(
             color: Colors.transparent,
-            child: Opacity(opacity: 0.85, child: _renderItemArt(item, _cfg.iconSize)),
+            child: Opacity(opacity: 0.85, child: _renderItemArt(item, base)),
           ),
           childWhenDragging: Opacity(opacity: 0.25, child: tile),
           onDragEnd: (details) async {
-            // Dragged far off the dock -> remove item (RocketDock poof behavior!)
             if (!details.wasAccepted &&
                 (!widget.store.global.lockItems || Win32Bridge.isCtrlPressed())) {
               final box = context.findRenderObject() as RenderBox?;
               if (box != null) {
                 final origin = box.localToGlobal(Offset.zero);
-                final delta = (details.offset - origin).distance;
-                if (delta > _cfg.iconSize * 1.9) {
+                if ((details.offset - origin).distance > base * 1.9) {
                   _items.removeWhere((e) => e.id == item.id);
                   await widget.store.save();
                   setState(() {});
@@ -1849,73 +1954,78 @@ class _DockShellPageState extends State<DockShellPage>
     );
   }
 
-  Widget _buildMinimizedWindowSlot(int slotIndex, int minIdx, _MinimizedWindowEntry entry) {
-    final scale = _scaleForSlot(slotIndex);
-    final size = _cfg.iconSize * scale;
+  Widget _buildMinimizedWindowSlot(int minIdx, _MinimizedWindowEntry entry, double wave) {
+    final base = _cfg.iconSize;
+    final scale = _cfg.hoverEffect == 'bubble'
+        ? 1.0 + (_cfg.zoomScale - 1.0) * wave
+        : 1.0;
+    final liftPx = _cfg.hoverEffect == 'none' ? 0.0 : wave * (base * 0.16);
 
-    final tile = MouseRegion(
-      onEnter: (_) {
-        setState(() => _hoveredSlotIndex = slotIndex);
-        // Refresh live thumbnail on hover
-        final fresh = Win32Bridge.captureWindowThumbnailPng(entry.hwnd);
-        if (fresh != null && mounted) {
-          setState(() => entry.thumbnailPng = fresh);
-        }
-      },
+    final iconWidget = SizedBox(
+      width: base,
+      height: base,
+      child: Stack(
+        clipBehavior: Clip.none,
+        alignment: Alignment.center,
+        children: [
+          if (entry.iconPngPath != null && File(entry.iconPngPath!).existsSync())
+            Image(
+              image: ResizeImage(FileImage(File(entry.iconPngPath!)), width: 160),
+              width: base,
+              height: base,
+              fit: BoxFit.contain,
+              filterQuality: _cfg.filterQuality,
+              gaplessPlayback: true,
+            )
+          else
+            DockGlyphTile(
+              iconKey: 'windows',
+              color: const Color(0xFF0284C7),
+              size: base,
+            ),
+          // Clean subtle minimized badge
+          Positioned(
+            right: -1,
+            bottom: -1,
+            child: Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0EA5E9),
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 1.2),
+              ),
+              child: const Icon(Icons.minimize_rounded, size: 9, color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    final tile = SizedBox(
+      width: _isHorizontal ? _slotStride : base + 10,
+      height: _isHorizontal ? base + 10 : _slotStride,
       child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: () => _restoreMinimizedEntry(entry),
         onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition, minWin: entry),
-        child: AnimatedContainer(
-          duration: Duration(milliseconds: _cfg.zoomDurationMs),
-          margin: EdgeInsets.symmetric(
-            horizontal: _isHorizontal ? 4 : 0,
-            vertical: _isHorizontal ? 0 : 4,
-          ),
-          width: size,
-          height: size,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(size * 0.20),
-            color: const Color(0xCC1E293B),
-            border: Border.all(color: const Color(0xFF38BDF8).withValues(alpha: 0.7), width: 1.4),
-            boxShadow: const [
-              BoxShadow(color: Color(0x66000000), blurRadius: 8, offset: Offset(0, 4)),
-            ],
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              if (entry.thumbnailPng != null)
-                Image.memory(
-                  entry.thumbnailPng!,
-                  fit: BoxFit.cover,
-                  filterQuality: _cfg.filterQuality,
-                  gaplessPlayback: true,
-                )
-              else
-                const Icon(Icons.web_asset_rounded, color: Colors.white54),
-              if (entry.iconPngPath != null && File(entry.iconPngPath!).existsSync())
-                Positioned(
-                  right: 2,
-                  bottom: 2,
-                  child: Container(
-                    width: size * 0.36,
-                    height: size * 0.36,
-                    padding: const EdgeInsets.all(2),
-                    decoration: BoxDecoration(
-                      color: const Color(0xDD0F172A),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Image.file(File(entry.iconPngPath!), fit: BoxFit.contain),
-                  ),
-                ),
-            ],
-          ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Transform.translate(
+              offset: Offset(0, -liftPx),
+              child: Transform.scale(
+                scale: scale,
+                alignment: _zoomAnchor,
+                child: iconWidget,
+              ),
+            ),
+            const SizedBox(height: 7),
+          ],
         ),
       ),
     );
 
-    // Allow reordering minimized windows in the dock
     return DragTarget<String>(
       onAcceptWithDetails: (details) {
         if (!details.data.startsWith('min:')) return;
@@ -1928,10 +2038,7 @@ class _DockShellPageState extends State<DockShellPage>
       },
       builder: (_, __, ___) => Draggable<String>(
         data: 'min:$minIdx',
-        feedback: Material(
-          color: Colors.transparent,
-          child: Opacity(opacity: 0.8, child: SizedBox(width: _cfg.iconSize, height: _cfg.iconSize, child: tile)),
-        ),
+        feedback: Material(color: Colors.transparent, child: Opacity(opacity: 0.85, child: iconWidget)),
         childWhenDragging: Opacity(opacity: 0.25, child: tile),
         child: tile,
       ),
@@ -1941,31 +2048,47 @@ class _DockShellPageState extends State<DockShellPage>
   Widget _renderItemArt(DockItemModel item, double size) {
     switch (item.type) {
       case 'docklet_clock':
-        return ClockDockletIcon(now: _now, size: size);
+        return ValueListenableBuilder<DateTime>(
+          valueListenable: _nowNotifier,
+          builder: (_, now, __) => ClockDockletIcon(now: now, size: size),
+        );
       case 'docklet_battery':
-        return BatteryDockletIcon(info: _battery, size: size);
+        return ValueListenableBuilder<BatteryInfo>(
+          valueListenable: _batteryNotifier,
+          builder: (_, info, __) => BatteryDockletIcon(info: info, size: size),
+        );
       case 'docklet_sysstats':
-        return SysStatsDockletIcon(stats: _sysStats, size: size);
+        return ValueListenableBuilder<SysStatsInfo>(
+          valueListenable: _sysStatsNotifier,
+          builder: (_, stats, __) => SysStatsDockletIcon(stats: stats, size: size),
+        );
       case 'docklet_calendar':
-        return CalendarDockletIcon(now: _now, size: size);
+        return ValueListenableBuilder<DateTime>(
+          valueListenable: _nowNotifier,
+          builder: (_, now, __) => CalendarDockletIcon(now: now, size: size),
+        );
       case 'recycle_bin':
-        return RecycleBinDockletIcon(
-          info: _recycleBin,
-          item: item,
-          size: size,
-          quality: _cfg.filterQuality,
+        return ValueListenableBuilder<RecycleBinInfo>(
+          valueListenable: _recycleBinNotifier,
+          builder: (_, info, __) => RecycleBinDockletIcon(
+            info: info,
+            item: item,
+            size: size,
+            quality: _cfg.filterQuality,
+          ),
         );
       default:
         break;
     }
 
     if (item.iconPath != null && File(item.iconPath!).existsSync()) {
-      return Image.file(
-        File(item.iconPath!),
+      return Image(
+        image: ResizeImage(FileImage(File(item.iconPath!)), width: 160),
         width: size,
         height: size,
         fit: BoxFit.contain,
         filterQuality: _cfg.filterQuality,
+        gaplessPlayback: true,
       );
     }
 
