@@ -14,6 +14,7 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'debug_monitor.dart';
 import 'dev_watcher.dart';
 import 'dialogs.dart';
 import 'docklets.dart';
@@ -26,6 +27,7 @@ extension _SafeIterable<T> on Iterable<T> {
 }
 
 void _logRuntimeError(Object error, StackTrace? stack) {
+  DebugMonitor.log('ERR', 'runtime', '$error');
   try {
     final dir = PortableIniStore.resolvePortableDir();
     final logFile = File(p.join(dir.path, 'aerodock_error.log'));
@@ -70,16 +72,54 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
 
   var dockId = 1;
   var isSettingsWindow = false;
+  var isDebugWindow = false;
   var settingsTab = 0;
 
   for (final arg in args) {
     if (arg == '--settings') {
       isSettingsWindow = true;
+    } else if (arg == '--debug') {
+      isDebugWindow = true;
     } else if (arg.startsWith('--dock=')) {
       dockId = int.tryParse(arg.substring(7))?.clamp(1, 4) ?? 1;
     } else if (arg.startsWith('--tab=')) {
-      settingsTab = int.tryParse(arg.substring(6))?.clamp(0, 7) ?? 0;
+      settingsTab = int.tryParse(arg.substring(6))?.clamp(0, 8) ?? 0;
     }
+  }
+
+  // Dedicated standalone floating Live Debug & Performance Monitor window (`--debug`)
+  if (isDebugWindow) {
+    final store = await PortableIniStore.load(allowAutoMigrate: false);
+    AppI18n.loadExternalLanguages(store.languagesDir);
+    AppI18n.currentCode = store.global.language;
+    const debugOpts = WindowOptions(
+      size: Size(696, 576),
+      center: true,
+      backgroundColor: Colors.transparent,
+      skipTaskbar: false,
+      titleBarStyle: TitleBarStyle.hidden,
+      alwaysOnTop: true,
+    );
+    runApp(DebugWindowApp(store: store));
+    unawaited(
+      windowManager.waitUntilReadyToShow(debugOpts, () async {
+        try {
+          await windowManager.setAsFrameless();
+          await windowManager.setHasShadow(false);
+          await windowManager.setBackgroundColor(Colors.transparent);
+          await windowManager.setResizable(false);
+          await windowManager.setAlwaysOnTop(true);
+          await windowManager.center();
+          await windowManager.show();
+          await windowManager.focus();
+          await acrylic.Window.setEffect(
+            effect: acrylic.WindowEffect.transparent,
+            color: const Color(0x00000000),
+          );
+        } catch (_) {}
+      }),
+    );
+    return;
   }
 
   // Dedicated standalone Settings window so ALL docks stay visible for Live Preview!
@@ -87,6 +127,12 @@ Future<void> _bootstrapAeroDock(List<String> args) async {
     final store = await PortableIniStore.load(allowAutoMigrate: false);
     AppI18n.loadExternalLanguages(store.languagesDir);
     AppI18n.currentCode = store.global.language;
+    DebugMonitor.configure(
+      enabled: store.global.debugMode,
+      portableDir: store.portableDir,
+      processTag: 'settings',
+      dockId: 0,
+    );
     try {
       store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
     } catch (_) {}
@@ -327,6 +373,91 @@ class _StandaloneSettingsHostState extends State<_StandaloneSettingsHost> {
             await widget.store.fullReset();
           },
           onClose: () async {
+            DebugMonitor.dispose();
+            await windowManager.destroy();
+            exit(0);
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class DebugWindowApp extends StatelessWidget {
+  final PortableIniStore store;
+
+  const DebugWindowApp({super.key, required this.store});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'AeroDock — Монитор отладки',
+      theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF10B981),
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: _StandaloneDebugHost(store: store),
+    );
+  }
+}
+
+class _StandaloneDebugHost extends StatefulWidget {
+  final PortableIniStore store;
+
+  const _StandaloneDebugHost({required this.store});
+
+  @override
+  State<_StandaloneDebugHost> createState() => _StandaloneDebugHostState();
+}
+
+class _StandaloneDebugHostState extends State<_StandaloneDebugHost> {
+  late bool _debugEnabled;
+  Timer? _watchTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _debugEnabled = widget.store.global.debugMode;
+    final quitFile = File(p.join(widget.store.portableDir.path, '.aerodock_quit'));
+    _watchTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      if (quitFile.existsSync()) {
+        await windowManager.destroy();
+        exit(0);
+      }
+      if (await widget.store.hasExternalChanges()) {
+        await widget.store.reloadFromDisk();
+        if (mounted && _debugEnabled != widget.store.global.debugMode) {
+          setState(() => _debugEnabled = widget.store.global.debugMode);
+        }
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _watchTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: Center(
+        child: LiveDebugMonitorPanel(
+          store: widget.store,
+          debugEnabled: _debugEnabled,
+          isStandalone: true,
+          onToggleDebug: (val) async {
+            setState(() => _debugEnabled = val);
+            await widget.store.saveGlobalChange((g) => g.debugMode = val, skipProfileSync: true);
+          },
+          onClose: () async {
             await windowManager.destroy();
             exit(0);
           },
@@ -499,6 +630,7 @@ class _DockShellPageState extends State<DockShellPage>
   void initState() {
     super.initState();
     _isAutoHidden = _cfg.autoHide;
+    _syncDebugMonitorState();
     windowManager.addListener(this);
     if (_isPrimary) {
       trayManager.addListener(this);
@@ -569,8 +701,8 @@ class _DockShellPageState extends State<DockShellPage>
       }
     });
 
-    // 5. Ultra-fast Live Settings & Multi-Dock INI sync every 220ms (mtime check < 0.05ms!)
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 220), (_) {
+    // 5. Fast Live Settings & Multi-Dock INI sync every 300ms (uses .aerodock_rev fast-path!)
+    _syncTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
       _checkMultiDockSync();
     });
 
@@ -581,8 +713,20 @@ class _DockShellPageState extends State<DockShellPage>
     });
   }
 
+  void _syncDebugMonitorState() {
+    DebugMonitor.configure(
+      enabled: widget.store.global.debugMode,
+      portableDir: widget.store.portableDir,
+      processTag: 'dock$_dockId',
+      dockId: _dockId,
+      itemCountProvider: () => _items.length,
+      positionProvider: () => _cfg.position,
+    );
+  }
+
   @override
   void dispose() {
+    DebugMonitor.dispose();
     _clockTimer?.cancel();
     _statsTimer?.cancel();
     _recycleTimer?.cancel();
@@ -646,21 +790,25 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   void _pollStatsNow() {
-    if (_items.any((e) => e.type == 'docklet_battery')) {
-      final bat = Win32Bridge.getBatteryStatus();
-      if (bat != _batteryNotifier.value) _batteryNotifier.value = bat;
-    }
-    if (_items.any((e) => e.type == 'docklet_sysstats')) {
-      final st = Win32Bridge.getCpuRamStats();
-      if (st != _sysStatsNotifier.value) _sysStatsNotifier.value = st;
-    }
+    DebugMonitor.traceSync('stats_poll', () {
+      if (_items.any((e) => e.type == 'docklet_battery')) {
+        final bat = Win32Bridge.getBatteryStatus();
+        if (bat != _batteryNotifier.value) _batteryNotifier.value = bat;
+      }
+      if (_items.any((e) => e.type == 'docklet_sysstats')) {
+        final st = Win32Bridge.getCpuRamStats();
+        if (st != _sysStatsNotifier.value) _sysStatsNotifier.value = st;
+      }
+    });
   }
 
   void _pollRecycleBinNow() {
-    if (_items.any((e) => e.type == 'recycle_bin')) {
-      final info = Win32Bridge.queryRecycleBin();
-      if (info != _recycleBinNotifier.value) _recycleBinNotifier.value = info;
-    }
+    DebugMonitor.traceSync('recycle_poll', () {
+      if (_items.any((e) => e.type == 'recycle_bin')) {
+        final info = Win32Bridge.queryRecycleBin();
+        if (info != _recycleBinNotifier.value) _recycleBinNotifier.value = info;
+      }
+    });
   }
 
   // ============================================================================
@@ -729,8 +877,18 @@ class _DockShellPageState extends State<DockShellPage>
       }
 
       // ALWAYS watch Settings.ini so the standalone Live Settings window updates EVERY dock in real time!
-      if (await widget.store.hasExternalChanges()) {
-        await widget.store.reloadFromDisk();
+      final changed = await DebugMonitor.traceAsync(
+        'ini_sync',
+        () => widget.store.hasExternalChanges(),
+        warnThresholdMs: 25,
+      );
+      if (changed) {
+        await DebugMonitor.traceAsync(
+          'ini_reload',
+          () => widget.store.reloadFromDisk(),
+          warnThresholdMs: 60,
+        );
+        _syncDebugMonitorState();
         AppI18n.currentCode = widget.store.global.language;
         _externalSkins = widget.store.scanExternalSkins();
         _externalDocklets = widget.store.scanExternalDocklets();
@@ -749,6 +907,11 @@ class _DockShellPageState extends State<DockShellPage>
         _applyLayerAndAcrylic();
         await _syncWindowGeometry();
         await _ensureDockVisible();
+        DebugMonitor.log(
+          'INFO',
+          'ini_sync',
+          'Панель $_dockId синхронизирована: pos=${_cfg.position}, size=${_cfg.iconSize.round()}px, items=${_items.length}',
+        );
       }
     } catch (e, st) {
       _logRuntimeError(e, st);
@@ -802,12 +965,15 @@ class _DockShellPageState extends State<DockShellPage>
             MenuItem(key: 'settings_dev', label: 'Панель «Разработка» (GitHub)…'),
             MenuItem(key: 'settings_backup', label: 'Бэкапы и восстановление…'),
             MenuItem(key: 'backup_now', label: 'Создать бэкап сейчас'),
-            MenuItem(key: 'import_rd135', label: 'Импорт Settings.ini (RocketDock 1.3.5 / AeroDock)…'),
+            MenuItem(key: 'import_rd_auto', label: 'Авто-импорт RocketDock 1.3.5 (Реестр)…'),
+            MenuItem(key: 'import_rd135', label: 'Импорт Settings.ini / .reg…'),
             MenuItem.separator(),
             MenuItem(key: 'toggle_dock2', label: 'Панель 2 (Справа)${g.dock2Enabled ? ' ✓' : ''}'),
             MenuItem(key: 'toggle_dock3', label: 'Панель 3 (Сверху)${g.dock3Enabled ? ' ✓' : ''}'),
             MenuItem(key: 'toggle_dock4', label: 'Панель «Разработка» (Слева)${g.devDockEnabled ? ' ✓' : ''}'),
             MenuItem.separator(),
+            MenuItem(key: 'toggle_debug', label: 'Отладка и профилирование${g.debugMode ? ' ✓' : ''}'),
+            MenuItem(key: 'open_debug_win', label: 'Открыть монитор отладки…'),
             MenuItem(key: 'open_dir', label: 'Открыть папку AeroDock'),
             MenuItem(key: 'quit', label: AppI18n.t('quit')),
           ],
@@ -848,6 +1014,10 @@ class _DockShellPageState extends State<DockShellPage>
         final b = await widget.store.createBackup(tag: 'manual');
         _showToast(b != null ? 'Бэкап создан: ${b.name}' : 'Не удалось создать бэкап');
         break;
+      case 'import_rd_auto':
+        if (_suspended) await _toggleGlobalSuspend();
+        await _autoImportRocketDock();
+        break;
       case 'import_rd135':
         if (_suspended) await _toggleGlobalSuspend();
         await _importRocketDock135ViaPicker();
@@ -866,6 +1036,15 @@ class _DockShellPageState extends State<DockShellPage>
         await widget.store.saveGlobalChange((g) => g.devDockEnabled = !g.devDockEnabled);
         await _reconcileSiblingDocks();
         await _rebuildTrayMenu();
+        break;
+      case 'toggle_debug':
+        await widget.store.saveGlobalChange((g) => g.debugMode = !g.debugMode);
+        _syncDebugMonitorState();
+        await _rebuildTrayMenu();
+        _showToast(widget.store.global.debugMode ? 'Режим отладки ВКЛЮЧЁН' : 'Режим отладки ВЫКЛЮЧЕН');
+        break;
+      case 'open_debug_win':
+        await _openStandaloneDebugWindow();
         break;
       case 'open_dir':
         Win32Bridge.shellExecute(target: widget.store.portableDir.path);
@@ -914,6 +1093,12 @@ class _DockShellPageState extends State<DockShellPage>
   // ============================================================================
 
   void _pollWindowsAndRunning() {
+    DebugMonitor.traceSync('win_poll', () {
+      _pollWindowsAndRunningImpl();
+    }, warnThresholdMs: 18);
+  }
+
+  void _pollWindowsAndRunningImpl() {
     final windows = Win32Bridge.enumerateWindows(includeHiddenHwnds: _hiddenByDockHwnds);
     _openWindows = windows;
 
@@ -1176,6 +1361,10 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   Future<void> _syncWindowGeometry() async {
+    await DebugMonitor.traceAsync('geometry', _syncWindowGeometryImpl, warnThresholdMs: 50);
+  }
+
+  Future<void> _syncWindowGeometryImpl() async {
     if (_suspended) return;
     if (_ownHwnd == 0) _ownHwnd = Win32Bridge.findOwnWindowHandle();
 
@@ -1348,31 +1537,33 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   void _extractMissingIcons() {
-    var changed = false;
-    for (final item in _items) {
-      if ((item.type == 'file' || item.type == 'path' || item.type == 'blank') &&
-          item.target.isNotEmpty) {
-        // Re-extract if missing OR if still pointing to an old blurry 32px ico_* cache file
-        final needsUpgrade = item.iconPath == null ||
-            !safeFileExists(item.iconPath) ||
-            p.basename(item.iconPath!).startsWith('ico_');
-        if (needsUpgrade) {
-          final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
-          if (png != item.iconPath) {
-            item.iconPath = png;
-            changed = true;
+    DebugMonitor.traceSync('icon_extract', () {
+      var changed = false;
+      for (final item in _items) {
+        if ((item.type == 'file' || item.type == 'path' || item.type == 'blank') &&
+            item.target.isNotEmpty) {
+          // Re-extract if missing OR if still pointing to an old blurry 32px ico_* cache file
+          final needsUpgrade = item.iconPath == null ||
+              !safeFileExists(item.iconPath) ||
+              p.basename(item.iconPath!).startsWith('ico_');
+          if (needsUpgrade) {
+            final png = Win32Bridge.extractIconToPng(item.target, widget.store.iconsCacheDir);
+            if (png != item.iconPath) {
+              item.iconPath = png;
+              changed = true;
+            }
           }
         }
       }
-    }
-    if (changed && mounted) {
-      setState(() {});
-      // Never overwrite Settings.ini while standalone Settings window is open,
-      // and always merge ONLY this dock's items so panel positions are never clobbered!
-      if (_settingsProcess == null) {
-        unawaited(widget.store.saveDockItemsOnly(_dockId, skipProfileSync: true));
+      if (changed && mounted) {
+        setState(() {});
+        // Never overwrite Settings.ini while standalone Settings window is open,
+        // and always merge ONLY this dock's items so panel positions are never clobbered!
+        if (_settingsProcess == null) {
+          unawaited(widget.store.saveDockItemsOnly(_dockId, skipProfileSync: true));
+        }
       }
-    }
+    }, warnThresholdMs: 80);
   }
 
   // ============================================================================
@@ -1513,6 +1704,32 @@ class _DockShellPageState extends State<DockShellPage>
     _applyLayerAndAcrylic();
     await _syncWindowGeometry();
     _showToast(importRes.message);
+  }
+
+  Future<void> _autoImportRocketDock() async {
+    final importRes = await widget.store.autoImportRocketDockFromSystem(
+      targetDockId: _dockId,
+    );
+    AppI18n.currentCode = widget.store.global.language;
+    _externalSkins = widget.store.scanExternalSkins();
+    await _refreshDisplaysAndWorkArea();
+    if (_isPrimary) {
+      await _reconcileSiblingDocks();
+      await _rebuildTrayMenu();
+    }
+    _extractMissingIcons();
+    if (mounted) setState(() {});
+    _applyLayerAndAcrylic();
+    await _syncWindowGeometry();
+    _showToast(importRes.message);
+  }
+
+  Future<void> _openStandaloneDebugWindow() async {
+    try {
+      await Process.start(Platform.resolvedExecutable, ['--debug']);
+    } catch (_) {
+      await _openSettingsTab(8);
+    }
   }
 
   Future<void> _handleExternalDrop(DropDoneDetails details) async {
@@ -1739,8 +1956,12 @@ class _DockShellPageState extends State<DockShellPage>
       ),
       const PopupMenuDivider(),
       PopupMenuItem(
+        value: 'import_rd_auto',
+        child: const Text('⚡ Авто-импорт RocketDock 1.3.5 (Реестр)…'),
+      ),
+      PopupMenuItem(
         value: 'import_rd135',
-        child: const Text('📥 Импорт Settings.ini (RocketDock 1.3.5 / AeroDock)…'),
+        child: const Text('📥 Импорт Settings.ini / .reg…'),
       ),
       PopupMenuItem(
         value: 'open_dev_settings',
@@ -1749,6 +1970,14 @@ class _DockShellPageState extends State<DockShellPage>
       PopupMenuItem(
         value: 'open_backup_settings',
         child: const Text('💾 Бэкапы и восстановление…'),
+      ),
+      PopupMenuItem(
+        value: 'toggle_debug',
+        child: Text('🩺 Отладка и нагрузка${g.debugMode ? ' ✓' : ''}'),
+      ),
+      PopupMenuItem(
+        value: 'open_debug_win',
+        child: const Text('📊 Открыть монитор отладки…'),
       ),
       PopupMenuItem(
         value: 'toggle_lock',
@@ -2010,6 +2239,9 @@ class _DockShellPageState extends State<DockShellPage>
         }
         setState(() {});
         break;
+      case 'import_rd_auto':
+        await _autoImportRocketDock();
+        break;
       case 'import_rd135':
         await _importRocketDock135ViaPicker();
         break;
@@ -2018,6 +2250,15 @@ class _DockShellPageState extends State<DockShellPage>
         break;
       case 'open_backup_settings':
         await _openSettingsTab(7);
+        break;
+      case 'toggle_debug':
+        await widget.store.saveGlobalChange((g) => g.debugMode = !g.debugMode);
+        _syncDebugMonitorState();
+        if (_isPrimary) await _rebuildTrayMenu();
+        _showToast(widget.store.global.debugMode ? 'Режим отладки ВКЛЮЧЁН' : 'Режим отладки ВЫКЛЮЧЕН');
+        break;
+      case 'open_debug_win':
+        await _openStandaloneDebugWindow();
         break;
       case 'open_settings':
         await _openSettingsTab(0);

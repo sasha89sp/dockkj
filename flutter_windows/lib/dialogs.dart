@@ -3,10 +3,12 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'debug_monitor.dart';
 import 'dev_watcher.dart';
 import 'docklets.dart';
 import 'i18n.dart';
@@ -90,7 +92,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
   @override
   void initState() {
     super.initState();
-    _tab = widget.initialTab.clamp(0, 7);
+    _tab = widget.initialTab.clamp(0, 8);
     _editingDockId = widget.activeDockId.clamp(1, 4);
     _rdImportTargetDock = widget.activeDockId.clamp(1, 4);
     _global = widget.store.global.copy();
@@ -325,6 +327,41 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     }
   }
 
+  Future<void> _autoImportRocketDockFromSystem() async {
+    _liveSaveTimer?.cancel();
+    _setBanner('Поиск RocketDock 1.3.5 в Реестре Windows и Program Files…');
+    final importRes = await widget.store.autoImportRocketDockFromSystem(
+      targetDockId: _rdImportTargetDock,
+      importVisualSettings: _rdImportVisuals,
+      replaceExistingItems: _rdImportReplace,
+    );
+    if (!mounted) return;
+    setState(() {
+      _global = widget.store.global.copy();
+      _dev = widget.store.devSettings.copy();
+      _backup = widget.store.backupSettings.copy();
+      _watchFolderCtrl.text = _dev.watchFolder;
+      _appsRootCtrl.text = _dev.appsRootFolder;
+      _preserveExtsCtrl.text = _dev.defaultPreserveExts;
+      _backupFolderCtrl.text = _backup.backupFolder;
+      for (var id = 1; id <= 4; id++) {
+        _panels[id] = (widget.store.panels[id] ?? DockPanelConfig.defaultFor(id)).copy();
+      }
+      if (importRes.ok) {
+        _backups = widget.store.listBackups();
+      }
+      _statusBanner = importRes.message;
+      _statusIsError = !importRes.ok;
+    });
+    if (importRes.ok) {
+      try {
+        _initialIniSnapshot = widget.store.iniFile.readAsStringSync();
+      } catch (_) {}
+      _liveDirty = false;
+      widget.onSaved();
+    }
+  }
+
   Future<void> _addDevRule() async {
     final prefix = _rulePrefixCtrl.text.trim();
     if (prefix.isEmpty) {
@@ -435,6 +472,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       (Icons.palette_rounded, AppI18n.t('tab_style')),
       (Icons.flash_on_rounded, AppI18n.t('tab_behavior')),
       (Icons.backup_rounded, 'Бэкап и сброс'),
+      (Icons.monitor_heart_rounded, 'Отладка'),
     ];
 
     return Container(
@@ -670,6 +708,15 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                                         ),
                                       ),
                                     ),
+                                  if (i == 8 && _global.debugMode)
+                                    Container(
+                                      width: 8,
+                                      height: 8,
+                                      decoration: const BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: Color(0xFF34D399),
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
@@ -689,7 +736,8 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                       4 => _buildPositionTab(),
                       5 => _buildStyleTab(),
                       6 => _buildBehaviorTab(),
-                      _ => _buildAboutDefaultsTab(),
+                      7 => _buildAboutDefaultsTab(),
+                      _ => _buildDebugTab(),
                     },
                   ),
                 ),
@@ -776,14 +824,16 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               ),
               const SizedBox(height: 5),
               const Text(
-                'Для Settings.ini AeroDock — переносит СРАЗУ ВСЕ 4 панели, их расположение, настройки и иконки. Для оригинального RocketDock 1.3.5 (.ini / .reg, UTF-16 / Windows-1251) — переносит ярлыки, иконки и положение в выбранную панель. Также можно перетащить .ini прямо на панель.',
+                'RocketDock 1.3.5 по умолчанию хранит ярлыки в Реестре Windows (HKCU\\Software\\RocketDock) — используйте кнопку «Авто-импорт» ниже. Также поддерживаются файлы Settings.ini / .reg (RocketDock 1.3.5 и AeroDock — переносит все 4 панели).',
                 style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.35),
               ),
               const SizedBox(height: 10),
-              Row(
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   const Text('Импортировать в:', style: TextStyle(fontSize: 11.5, color: Colors.white70)),
-                  const SizedBox(width: 8),
                   SizedBox(
                     width: 155,
                     child: DropdownButtonFormField<int>(
@@ -802,15 +852,25 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                       },
                     ),
                   ),
-                  const Spacer(),
+                  ElevatedButton.icon(
+                    onPressed: _autoImportRocketDockFromSystem,
+                    icon: const Icon(Icons.auto_fix_high_rounded, size: 15),
+                    label: const Text('Авто-импорт RocketDock (Реестр)', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: const Color(0xFF020617),
+                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
                   ElevatedButton.icon(
                     onPressed: _importRocketDock135,
                     icon: const Icon(Icons.folder_open_rounded, size: 15),
-                    label: const Text('Выбрать .ini файл…', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700)),
+                    label: const Text('Выбрать .ini / .reg…', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF38BDF8),
                       foregroundColor: const Color(0xFF020617),
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
                   ),
@@ -2247,6 +2307,29 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     );
   }
 
+  // ---- TAB 8: Real-Time Debug & Performance Profiler ----
+  Widget _buildDebugTab() {
+    return LiveDebugMonitorPanel(
+      store: widget.store,
+      debugEnabled: _global.debugMode,
+      onToggleDebug: (val) {
+        setState(() => _global.debugMode = val);
+        DebugMonitor.configure(
+          enabled: val,
+          portableDir: widget.store.portableDir,
+          processTag: 'settings',
+          dockId: 0,
+        );
+        _scheduleLiveApply(immediate: true);
+      },
+      onOpenStandaloneWindow: () {
+        try {
+          Process.start(Platform.resolvedExecutable, ['--debug']);
+        } catch (_) {}
+      },
+    );
+  }
+
   Widget _folderBtn(String label, String path) {
     return OutlinedButton.icon(
       onPressed: () {
@@ -3222,6 +3305,695 @@ class CalendarPopover extends StatelessWidget {
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 5. Live Real-Time Debug & Performance Monitor (Embedded Tab + Standalone Window)
+// ============================================================================
+
+class LiveDebugMonitorPanel extends StatefulWidget {
+  final PortableIniStore store;
+  final bool debugEnabled;
+  final ValueChanged<bool> onToggleDebug;
+  final bool isStandalone;
+  final VoidCallback? onOpenStandaloneWindow;
+  final VoidCallback? onClose;
+
+  const LiveDebugMonitorPanel({
+    super.key,
+    required this.store,
+    required this.debugEnabled,
+    required this.onToggleDebug,
+    this.isStandalone = false,
+    this.onOpenStandaloneWindow,
+    this.onClose,
+  });
+
+  @override
+  State<LiveDebugMonitorPanel> createState() => _LiveDebugMonitorPanelState();
+}
+
+class _LiveDebugMonitorPanelState extends State<LiveDebugMonitorPanel> {
+  Timer? _refreshTimer;
+  List<ProcessDebugSnapshot> _procs = [];
+  List<DebugLogEntry> _logs = [];
+  List<String> _issues = [];
+  SysStatsInfo _sys = const SysStatsInfo(cpuPercent: 0, ramPercent: 0, usedGb: 0, totalGb: 0);
+  String _logFilter = 'ALL'; // ALL | ISSUES | IMPORT | PERF
+  String? _copyFeedback;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncPollingState();
+  }
+
+  @override
+  void didUpdateWidget(covariant LiveDebugMonitorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.debugEnabled != widget.debugEnabled) {
+      _syncPollingState();
+    }
+  }
+
+  void _syncPollingState() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    if (widget.debugEnabled) {
+      _pollOnce();
+      _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) => _pollOnce());
+    } else {
+      if (mounted) {
+        setState(() {
+          _procs = [];
+          _logs = [];
+          _issues = [];
+        });
+      }
+    }
+  }
+
+  void _pollOnce() {
+    if (!mounted || !widget.debugEnabled) return;
+    final procs = DebugMonitor.readAllProcessSnapshots(widget.store.portableDir);
+    final logs = DebugMonitor.readRecentLogs(widget.store.portableDir, maxLines: 160);
+    final issues = DebugMonitor.detectBottlenecks(procs, logs);
+    final sys = Win32Bridge.getCpuRamStats();
+    setState(() {
+      _procs = procs;
+      _logs = logs;
+      _issues = issues;
+      _sys = sys;
+    });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _copyReport() async {
+    final report = DebugMonitor.buildClipboardReport(widget.store.portableDir, widget.store);
+    await Clipboard.setData(ClipboardData(text: report));
+    if (!mounted) return;
+    setState(() => _copyFeedback = 'Отчёт скопирован в буфер обмена!');
+    Future<void>.delayed(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _copyFeedback = null);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final totalCpu = _procs.fold<double>(0, (s, e) => s + e.cpuPercent);
+    final totalRam = _procs.fold<double>(0, (s, e) => s + e.workingSetMb);
+    final totalGdi = _procs.fold<int>(0, (s, e) => s + e.gdiObjects);
+    final totalHandles = _procs.fold<int>(0, (s, e) => s + e.handleCount);
+    final totalJank = _procs.fold<int>(0, (s, e) => s + e.jankFrames);
+    final errCount = _logs.where((l) => l.level == 'ERR' || l.level == 'WARN').length;
+
+    // Aggregate subsystem ops across all processes
+    final mergedOps = <String, OpStat>{};
+    for (final pr in _procs) {
+      for (final op in pr.ops) {
+        final cur = mergedOps.putIfAbsent(op.name, () => OpStat(name: op.name));
+        cur.calls += op.calls;
+        cur.totalMs += op.totalMs;
+        if (op.maxMs > cur.maxMs) cur.maxMs = op.maxMs;
+        cur.lastMs = op.lastMs;
+      }
+    }
+    final topOps = mergedOps.values.toList()
+      ..sort((a, b) => b.totalMs.compareTo(a.totalMs));
+
+    final filteredLogs = _logs.where((l) {
+      return switch (_logFilter) {
+        'ISSUES' => l.level == 'ERR' || l.level == 'WARN' || l.level == 'PERF',
+        'IMPORT' => l.level == 'IMPORT' || l.tag.contains('import') || l.tag.contains('rd_'),
+        'PERF' => l.level == 'PERF',
+        _ => true,
+      };
+    }).toList();
+
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Master Toggle Banner
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: widget.debugEnabled
+                ? const Color(0x2210B981)
+                : const Color(0x331E293B),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: widget.debugEnabled ? const Color(0x8834D399) : Colors.white12,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                widget.debugEnabled ? Icons.monitor_heart_rounded : Icons.power_settings_new_rounded,
+                size: 20,
+                color: widget.debugEnabled ? const Color(0xFF34D399) : Colors.white54,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.debugEnabled
+                          ? 'Отладка и профилирование активны (обновление 1 сек)'
+                          : 'Режим отладки выключен (0% нагрузки, логи не ведутся)',
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    const Text(
+                      'Включайте только при диагностике. В выключенном состоянии все таймеры профилирования, сбор метрик и запись логов полностью отключены.',
+                      style: TextStyle(fontSize: 10.5, color: Colors.white60),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Switch(
+                value: widget.debugEnabled,
+                activeColor: const Color(0xFF34D399),
+                onChanged: widget.onToggleDebug,
+              ),
+            ],
+          ),
+        ),
+
+        if (!widget.debugEnabled) ...[
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0x280F172A),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Что показывает отладчик после включения:',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Color(0xFF7DD3FC)),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  '• Точную нагрузку CPU (%) и памяти RAM (МБ) по каждой панели отдельно (Панель 1, 2, 3, Разработка).\n'
+                  '• Контроль GDI-объектов, дескрипторов Windows и времени рендера кадров (Build / Raster мс, просадки FPS).\n'
+                  '• Профилировщик всех подсистем (ini_sync, win_poll, geometry, icon_extract, edge_hover, dev_watcher).\n'
+                  '• Журнал ошибок, импорта INI/Реестра и автоматический поиск узких мест с копированием отчёта в 1 клик.',
+                  style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.45),
+                ),
+              ],
+            ),
+          ),
+        ] else ...[
+          const SizedBox(height: 10),
+          // Action Bar
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              ElevatedButton.icon(
+                onPressed: _copyReport,
+                icon: const Icon(Icons.copy_all_rounded, size: 14),
+                label: Text(_copyFeedback ?? 'Копировать отчёт', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF38BDF8),
+                  foregroundColor: const Color(0xFF020617),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+              ),
+              if (!widget.isStandalone && widget.onOpenStandaloneWindow != null)
+                OutlinedButton.icon(
+                  onPressed: widget.onOpenStandaloneWindow,
+                  icon: const Icon(Icons.open_in_new_rounded, size: 14, color: Color(0xFF34D399)),
+                  label: const Text('Отдельное окно монитора', style: TextStyle(fontSize: 11, color: Color(0xFF6EE7B7))),
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Color(0x6634D399)),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+              OutlinedButton.icon(
+                onPressed: () {
+                  final dir = DebugMonitor.resolveDebugDir(widget.store.portableDir);
+                  if (!dir.existsSync()) dir.createSync(recursive: true);
+                  Win32Bridge.shellExecute(target: dir.path);
+                },
+                icon: const Icon(Icons.folder_open_rounded, size: 14, color: Colors.white70),
+                label: const Text('Папка логов', style: TextStyle(fontSize: 11, color: Colors.white70)),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Colors.white24),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+              ),
+              OutlinedButton.icon(
+                onPressed: () {
+                  DebugMonitor.clearLogs(widget.store.portableDir);
+                  _pollOnce();
+                },
+                icon: const Icon(Icons.delete_sweep_rounded, size: 14, color: Color(0xFFFDA4AF)),
+                label: const Text('Очистить логи', style: TextStyle(fontSize: 11, color: Color(0xFFFDA4AF))),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Color(0x55FB7185)),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+              ),
+            ],
+          ),
+
+          // Detected Bottlenecks / Problems Alert
+          if (_issues.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: const Color(0x33DC2626),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0x88F87171)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.warning_amber_rounded, size: 15, color: Color(0xFFFCA5A5)),
+                      SizedBox(width: 6),
+                      Text(
+                        'Обнаруженные проблемы и узкие места:',
+                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: Color(0xFFFECACA)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  for (final iss in _issues)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text('• $iss', style: const TextStyle(fontSize: 10.5, color: Colors.white)),
+                    ),
+                ],
+              ),
+            ),
+          ],
+
+          // 4 Live KPI Summary Cards
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              _kpiCard(
+                'CPU AeroDock',
+                '${totalCpu.toStringAsFixed(1)}%',
+                'Система: ${_sys.cpuPercent}%',
+                totalCpu > 5.0 ? const Color(0xFFF87171) : const Color(0xFF34D399),
+              ),
+              const SizedBox(width: 8),
+              _kpiCard(
+                'RAM (${_procs.length} проц.)',
+                '${totalRam.toStringAsFixed(0)} МБ',
+                'ПК: ${_sys.usedGb.toStringAsFixed(1)}/${_sys.totalGb.toStringAsFixed(0)} ГБ',
+                totalRam > 250 ? const Color(0xFFFBBF24) : const Color(0xFF38BDF8),
+              ),
+              const SizedBox(width: 8),
+              _kpiCard(
+                'GDI / Handles',
+                '$totalGdi / $totalHandles',
+                'Контроль утечек',
+                totalGdi > 350 ? const Color(0xFFF87171) : const Color(0xFFA78BFA),
+              ),
+              const SizedBox(width: 8),
+              _kpiCard(
+                'Проблемы / Фризы',
+                '$errCount / $totalJank',
+                'Ошибок / >20мс',
+                (errCount > 0 || totalJank > 5) ? const Color(0xFFFBBF24) : const Color(0xFF34D399),
+              ),
+            ],
+          ),
+
+          // Per-Process Resource Breakdown Table
+          const SizedBox(height: 12),
+          const Text(
+            'Процессы AeroDock (в реальном времени)',
+            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: Color(0xFF7DD3FC)),
+          ),
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0x33020617),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: _procs.isEmpty
+                ? const Text(
+                    'Ожидание телеметрии от активных панелей (1–2 сек)…',
+                    style: TextStyle(fontSize: 11, color: Colors.white54),
+                  )
+                : Column(
+                    children: [
+                      const Row(
+                        children: [
+                          Expanded(flex: 3, child: Text('Процесс', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                          SizedBox(width: 52, child: Text('CPU', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                          SizedBox(width: 62, child: Text('RAM', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                          SizedBox(width: 48, child: Text('GDI', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                          SizedBox(width: 78, child: Text('Кадр мс', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                          SizedBox(width: 48, child: Text('Икон.', style: TextStyle(fontSize: 10, color: Colors.white54, fontWeight: FontWeight.w700))),
+                        ],
+                      ),
+                      const Divider(color: Colors.white10, height: 10),
+                      for (final pr in _procs)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 3),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                flex: 3,
+                                child: Text(
+                                  '${pr.displayLabel}${pr.position.isNotEmpty ? " (${pr.position})" : ""} · PID ${pr.pid}',
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 10.5, color: Colors.white, fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 52,
+                                child: Text(
+                                  '${pr.cpuPercent.toStringAsFixed(1)}%',
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: pr.cpuPercent > 3.0 ? const Color(0xFFF87171) : const Color(0xFF34D399),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 62,
+                                child: Text(
+                                  '${pr.workingSetMb.toStringAsFixed(1)} МБ',
+                                  style: const TextStyle(fontSize: 10.5, color: Colors.white70),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 48,
+                                child: Text(
+                                  '${pr.gdiObjects}',
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    color: pr.gdiObjects > 300 ? const Color(0xFFFBBF24) : Colors.white70,
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 78,
+                                child: Text(
+                                  '${pr.avgBuildMs.toStringAsFixed(1)} / ${pr.avgRasterMs.toStringAsFixed(1)}',
+                                  style: const TextStyle(fontSize: 10.5, color: Colors.white70),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 48,
+                                child: Text(
+                                  '${pr.itemCount}',
+                                  style: const TextStyle(fontSize: 10.5, color: Color(0xFF7DD3FC)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+
+          // Subsystem Profiler Table
+          const SizedBox(height: 12),
+          const Text(
+            'Что нагружает систему (профиль подсистем)',
+            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: Color(0xFF7DD3FC)),
+          ),
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0x33020617),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: topOps.isEmpty
+                ? const Text(
+                    'Данных по подсистемам пока нет — они появятся через секунду работы панелей.',
+                    style: TextStyle(fontSize: 10.5, color: Colors.white54),
+                  )
+                : Column(
+                    children: [
+                      for (final op in topOps.take(10))
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2.5),
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 118,
+                                child: Text(
+                                  op.name,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 10.5,
+                                    fontFamily: 'Consolas',
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 64,
+                                child: Text(
+                                  '${op.calls} выз.',
+                                  style: const TextStyle(fontSize: 10, color: Colors.white54),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 76,
+                                child: Text(
+                                  'ср ${op.avgMs.toStringAsFixed(2)} мс',
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    color: op.avgMs > 10
+                                        ? const Color(0xFFF87171)
+                                        : (op.avgMs > 3 ? const Color(0xFFFBBF24) : const Color(0xFF34D399)),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 78,
+                                child: Text(
+                                  'макс ${op.maxMs.toStringAsFixed(1)} мс',
+                                  style: const TextStyle(fontSize: 10, color: Colors.white70),
+                                ),
+                              ),
+                              Expanded(
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: LinearProgressIndicator(
+                                    minHeight: 5,
+                                    value: (op.avgMs / 20.0).clamp(0.03, 1.0),
+                                    backgroundColor: Colors.white10,
+                                    color: op.avgMs > 10
+                                        ? const Color(0xFFF87171)
+                                        : (op.avgMs > 3 ? const Color(0xFFFBBF24) : const Color(0xFF38BDF8)),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+
+          // Live Event & Problem Log
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const Text(
+                'Журнал событий и проблем',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: Color(0xFF7DD3FC)),
+              ),
+              const Spacer(),
+              for (final f in [
+                ('ALL', 'Все'),
+                ('ISSUES', 'Проблемы'),
+                ('IMPORT', 'Импорт'),
+                ('PERF', 'Нагрузка'),
+              ])
+                Padding(
+                  padding: const EdgeInsets.only(left: 4),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: () => setState(() => _logFilter = f.$1),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: _logFilter == f.$1
+                            ? const Color(0x4438BDF8)
+                            : Colors.white.withValues(alpha: 0.05),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: _logFilter == f.$1 ? const Color(0xFF38BDF8) : Colors.white12,
+                        ),
+                      ),
+                      child: Text(
+                        f.$2,
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: _logFilter == f.$1 ? Colors.white : Colors.white60,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            height: widget.isStandalone ? 170 : 145,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0x66020617),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: filteredLogs.isEmpty
+                ? const Center(
+                    child: Text(
+                      'Событий по выбранному фильтру нет.',
+                      style: TextStyle(fontSize: 10.5, color: Colors.white38),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: filteredLogs.length,
+                    itemBuilder: (_, idx) {
+                      final e = filteredLogs[idx];
+                      final color = switch (e.level) {
+                        'ERR' => const Color(0xFFF87171),
+                        'WARN' => const Color(0xFFFBBF24),
+                        'PERF' => const Color(0xFFFB923C),
+                        'IMPORT' => const Color(0xFF38BDF8),
+                        _ => const Color(0xFF94A3B8),
+                      };
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 3),
+                        child: Text(
+                          '[${e.time}] [${e.level}] [${e.proc}/${e.tag}] ${e.message}',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontFamily: 'Consolas',
+                            color: color,
+                            height: 1.28,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ],
+    );
+
+    if (!widget.isStandalone) return content;
+
+    // Standalone floating monitor chrome
+    return Container(
+      width: 680,
+      height: 560,
+      decoration: BoxDecoration(
+        color: const Color(0xF50F172A),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0x6634D399)),
+        boxShadow: const [
+          BoxShadow(color: Color(0xB3000000), blurRadius: 28, offset: Offset(0, 10)),
+        ],
+      ),
+      child: Column(
+        children: [
+          GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onPanStart: (_) => windowManager.startDragging(),
+            child: Container(
+              height: 44,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: const BoxDecoration(
+                border: Border(bottom: BorderSide(color: Color(0x1FFFFFFF))),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.monitor_heart_rounded, color: Color(0xFF34D399), size: 18),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'AeroDock — Монитор отладки и нагрузки (Live)',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.white),
+                  ),
+                  const Spacer(),
+                  if (widget.onClose != null)
+                    IconButton(
+                      onPressed: widget.onClose,
+                      icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
+                      splashRadius: 16,
+                    ),
+                ],
+              ),
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(14),
+              child: content,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _kpiCard(String label, String value, String sub, Color accent) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+        decoration: BoxDecoration(
+          color: accent.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: accent.withValues(alpha: 0.35)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: const TextStyle(fontSize: 9.5, color: Colors.white60)),
+            const SizedBox(height: 2),
+            Text(value, style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w800, color: accent)),
+            Text(sub, style: const TextStyle(fontSize: 9.5, color: Colors.white54), overflow: TextOverflow.ellipsis),
+          ],
+        ),
       ),
     );
   }

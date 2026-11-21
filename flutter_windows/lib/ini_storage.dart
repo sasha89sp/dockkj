@@ -4,6 +4,9 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import 'debug_monitor.dart';
+import 'win32_bridge.dart';
+
 // ============================================================================
 // Pure Dart Windows-1251 (CP1251) + UTF-16LE + UTF-8 Decoder for RocketDock 1.3.5 INI
 // ============================================================================
@@ -220,6 +223,7 @@ class GlobalDockSettings {
   bool dock2Enabled;
   bool dock3Enabled;
   bool devDockEnabled; // Dock #4 — "Разработка"
+  bool debugMode; // Live real-time diagnostics & performance profiler (OFF by default)
 
   List<String> excludedWindows;
   List<String> iconFolders;
@@ -236,6 +240,7 @@ class GlobalDockSettings {
     this.dock2Enabled = false,
     this.dock3Enabled = false,
     this.devDockEnabled = true,
+    this.debugMode = false,
     List<String>? excludedWindows,
     List<String>? iconFolders,
   })  : excludedWindows = excludedWindows ?? [],
@@ -264,6 +269,7 @@ class GlobalDockSettings {
         dock2Enabled: dock2Enabled,
         dock3Enabled: dock3Enabled,
         devDockEnabled: devDockEnabled,
+        debugMode: debugMode,
         excludedWindows: List<String>.from(excludedWindows),
         iconFolders: List<String>.from(iconFolders),
       );
@@ -651,8 +657,12 @@ class PortableIniStore {
 
   DateTime? lastLoadedModified;
   String? _lastContentSignature;
+  int _lastIniSize = -1;
+  String? _lastRevToken;
   int _revision = 0;
   bool migratedFromPreviousVersion = false;
+
+  File get _revTokenFile => File(p.join(portableDir.path, '.aerodock_rev'));
 
   PortableIniStore({
     required this.portableDir,
@@ -983,6 +993,21 @@ class PortableIniStore {
 
   Future<bool> hasExternalChanges() async {
     try {
+      // Fast path #1: tiny 24-byte revision token written by AeroDock on every save()
+      // (avoids reading & hashing the entire Settings.ini across 4 processes every 300ms!)
+      if (_revTokenFile.existsSync()) {
+        final tok = _revTokenFile.readAsStringSync().trim();
+        if (_lastRevToken != null && tok == _lastRevToken) {
+          // Also check stat size/mtime in case user edited Settings.ini manually in Notepad
+          final st = iniFile.statSync();
+          if (st.size == _lastIniSize &&
+              lastLoadedModified != null &&
+              st.modified == lastLoadedModified) {
+            return false;
+          }
+        }
+      }
+
       if (!await iniFile.exists()) return false;
       final bytes = await iniFile.readAsBytes();
       if (bytes.isEmpty) return false;
@@ -993,25 +1018,89 @@ class PortableIniStore {
     }
   }
 
+  static String _expandWindowsEnvVars(String input) {
+    if (!input.contains('%')) return input;
+    return input.replaceAllMapped(RegExp(r'%([A-Za-z0-9_()]+)%'), (m) {
+      final name = m.group(1)!;
+      for (final entry in Platform.environment.entries) {
+        if (entry.key.toLowerCase() == name.toLowerCase()) {
+          return entry.value;
+        }
+      }
+      return m.group(0)!;
+    });
+  }
+
+  static String? _decodeRegHexUtf16(String hexCsv) {
+    final parts = hexCsv.split(',');
+    final bytes = <int>[];
+    for (final part in parts) {
+      final t = part.trim();
+      if (t.isEmpty) continue;
+      final b = int.tryParse(t, radix: 16);
+      if (b != null) bytes.add(b);
+    }
+    if (bytes.length < 2) return null;
+    final units = <int>[];
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      final code = bytes[i] | (bytes[i + 1] << 8);
+      if (code == 0) break;
+      units.add(code);
+    }
+    return _expandWindowsEnvVars(String.fromCharCodes(units));
+  }
+
   static String _unquoteIniValue(String raw) {
     final s = raw.trim();
     if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-      return s
-          .substring(1, s.length - 1)
-          .replaceAll(r'\\', r'\')
-          .replaceAll(r'\"', '"');
+      return _expandWindowsEnvVars(
+        s
+            .substring(1, s.length - 1)
+            .replaceAll(r'\\', r'\')
+            .replaceAll(r'\"', '"'),
+      );
     }
-    if (s.toLowerCase().startsWith('dword:')) {
+    final lower = s.toLowerCase();
+    if (lower.startsWith('dword:')) {
       final parsed = int.tryParse(s.substring(6).trim(), radix: 16);
       if (parsed != null) return parsed.toString();
+    }
+    if (lower.startsWith('hex(2):') || lower.startsWith('hex(1):')) {
+      final decoded = _decodeRegHexUtf16(s.substring(7));
+      if (decoded != null) return decoded;
     }
     return s;
   }
 
   static Map<String, Map<String, String>> parseIniText(String text) {
+    // Rejoin Windows .reg backslash line continuations (e.g. hex(2):...\n  00,43,...)
+    final rawLines = const LineSplitter().convert(text);
+    final mergedLines = <String>[];
+    final buf = StringBuffer();
+    for (final raw in rawLines) {
+      final trimmedRight = raw.trimRight();
+      if (buf.isNotEmpty) {
+        final cont = raw.trimLeft();
+        if (cont.endsWith(r'\') && !cont.endsWith(r'\\')) {
+          buf.write(cont.substring(0, cont.length - 1));
+        } else {
+          buf.write(cont);
+          mergedLines.add(buf.toString());
+          buf.clear();
+        }
+      } else if (trimmedRight.endsWith(r'\') &&
+          !trimmedRight.endsWith(r'\\') &&
+          trimmedRight.toLowerCase().contains('hex')) {
+        buf.write(trimmedRight.substring(0, trimmedRight.length - 1));
+      } else {
+        mergedLines.add(raw);
+      }
+    }
+    if (buf.isNotEmpty) mergedLines.add(buf.toString());
+
     final sections = <String, Map<String, String>>{};
     var currentSection = '';
-    for (final raw in const LineSplitter().convert(text)) {
+    for (final raw in mergedLines) {
       final line = raw.trim();
       if (line.isEmpty || line.startsWith(';') || line.startsWith('#')) continue;
       if (line.startsWith('[') && line.endsWith(']')) {
@@ -1031,16 +1120,16 @@ class PortableIniStore {
     return sections;
   }
 
-  /// Detect if an INI file is an original RocketDock 1.3.5 Settings.ini (or AeroDock Settings.ini).
+  /// Detect if an INI file is an original RocketDock 1.3.5 Settings.ini (or .reg export).
   static bool isRocketDock135Ini(Map<String, Map<String, String>> sections) {
     for (final entry in sections.entries) {
       final lower = entry.key.toLowerCase();
       if (lower == 'rocketdock' ||
           lower == 'rocketdock-settings' ||
           lower == r'software\rocketdock' ||
-          lower == r'rocketdock\icons' ||
-          lower == r'software\rocketdock\icons' ||
+          lower.contains(r'\rocketdock') ||
           lower == 'icons' ||
+          lower == 'iconsettings' ||
           lower.startsWith('rocketdock') ||
           lower.startsWith('icon') ||
           lower.startsWith('item')) {
@@ -1223,6 +1312,9 @@ class PortableIniStore {
                 ? _bool(g['Dock3Enabled'], global.dock3Enabled)
                 : legacyDockCount >= 3,
             devDockEnabled: _bool(g['DevDockEnabled'], global.devDockEnabled),
+            debugMode: g.containsKey('DebugMode')
+                ? _bool(g['DebugMode'], global.debugMode)
+                : global.debugMode,
             excludedWindows: _list(g['ExcludedWindows']),
             iconFolders: _list(g['IconFolders']).map(fromPortablePath).toList(),
           );
@@ -1274,6 +1366,7 @@ class PortableIniStore {
           );
         }
 
+        final parsedPerDock = <int, List<DockItemModel>>{};
         var importedPanelsCount = 0;
         var importedItemsTotal = 0;
         for (var id = 1; id <= 4; id++) {
@@ -1288,6 +1381,7 @@ class PortableIniStore {
           final iSec = sections['Dock$id-Items'];
           if (iSec != null) {
             final parsedItems = _parseAeroDockItemsSection(id, iSec, sourceBaseDir: baseDir);
+            parsedPerDock[id] = parsedItems;
             importedItemsTotal += parsedItems.length;
             if (replaceExistingItems) {
               dockItems[id] = parsedItems;
@@ -1297,13 +1391,30 @@ class PortableIniStore {
           }
         }
 
+        // Detect if user accidentally selected AeroDock's own default Settings.ini (not RocketDock 1.3.5)
+        final defaultIds = <String>{
+          for (var d = 1; d <= 4; d++) ...defaultItemsFor(d).map((e) => e.id),
+        };
+        final allImportedIds = <String>[
+          for (final list in parsedPerDock.values) ...list.map((e) => e.id),
+        ];
+        final customCount = allImportedIds.where((id) => !defaultIds.contains(id)).length;
+
+        DebugMonitor.log(
+          'IMPORT',
+          'ini_import',
+          'AeroDock INI: ${sourceFile.path} | панелей=$importedPanelsCount, всего=$importedItemsTotal, польз.=$customCount',
+        );
+
         await save();
+        final summary = customCount == 0
+            ? 'Профиль AeroDock загружен ($importedPanelsCount пан., $importedItemsTotal знач.), НО в этом файле только стандартные значки AeroDock — он не от RocketDock 1.3.5! Для переноса значков из RocketDock 1.3.5 нажмите «Авто-импорт из RocketDock (Реестр / ПК)».'
+            : 'Профиль AeroDock перенесён: $importedPanelsCount панелей, $importedItemsTotal значков (в т.ч. $customCount ваших), расположение и иконки сохранены!';
         return RocketDockImportResult(
           ok: true,
           importedItems: importedItemsTotal,
           importedSettings: importVisualSettings && importedPanelsCount > 0,
-          message:
-              'Профиль AeroDock перенесён: $importedPanelsCount панелей, $importedItemsTotal значков, расположение и иконки сохранены!',
+          message: summary,
         );
       }
 
@@ -1337,32 +1448,46 @@ class PortableIniStore {
             lower == 'rocketdock-settings' ||
             lower == r'software\rocketdock' ||
             lower.endsWith(r'\software\rocketdock') ||
+            lower.endsWith(r'\punksoftware\rocketdock') ||
             lower == 'settings' ||
             lower == 'dock') {
           rdMain ??= map;
           if (indexed) rdIconMaps.add(map);
         } else if (lower == r'rocketdock\icons' ||
             lower == r'software\rocketdock\icons' ||
-            lower.endsWith(r'\software\rocketdock\icons') ||
+            lower.endsWith(r'\rocketdock\icons') ||
             lower == 'rocketdock-icons' ||
             lower == 'icons' ||
+            lower == 'iconsettings' ||
             lower.endsWith(r'\icons')) {
           rdIconMaps.add(map);
         } else if (RegExp(r'(^|\\)(rocketdock[-_\\]?icon|icon|item)\d+$').hasMatch(lower) ||
-            RegExp(r'\\icons\\\d+$').hasMatch(lower)) {
+            RegExp(r'\\icons\\\d+$').hasMatch(lower) ||
+            RegExp(r'^\d+$').hasMatch(lower)) {
           perIconSections.add(map);
         } else if (indexed) {
           rdIconMaps.add(map);
         }
       }
 
+      DebugMonitor.log(
+        'IMPORT',
+        'ini_import',
+        'RocketDock разбор ${p.basename(sourceFile.path)}: секций=${sections.length} [${sections.keys.take(8).join(", ")}], rdMain=${rdMain != null}, iconMaps=${rdIconMaps.length}, perIcon=${perIconSections.length}',
+      );
+
       if (rdMain == null && rdIconMaps.isEmpty && perIconSections.isEmpty) {
-        return const RocketDockImportResult(
+        DebugMonitor.log(
+          'WARN',
+          'ini_import',
+          'Формат INI не распознан: ${sourceFile.path}, секции: ${sections.keys.join(", ")}',
+        );
+        return RocketDockImportResult(
           ok: false,
           importedItems: 0,
           importedSettings: false,
           message:
-              'Не удалось распознать формат INI (проверьте, что файл содержит секции [RocketDock], [Software\\RocketDock], [Icons] или [Dock1]).',
+              'Не удалось распознать формат INI (найдены секции: ${sections.keys.take(5).join(", ")}). Если RocketDock хранит настройки в Реестре Windows, нажмите «Авто-импорт из RocketDock (Реестр / ПК)».',
         );
       }
 
@@ -1681,13 +1806,34 @@ class PortableIniStore {
       if (targetDockId == 4) global.devDockEnabled = true;
 
       await save();
+      final previewNames = importedList
+          .where((e) => e.type != 'separator' && e.title.trim().isNotEmpty)
+          .take(5)
+          .map((e) => e.title.trim())
+          .join(', ');
+      DebugMonitor.log(
+        'IMPORT',
+        'ini_import',
+        'RocketDock 1.3.5 импорт успешен: ${importedList.length} значков в Панель $targetDockId ($previewNames)',
+      );
+      if (importedList.isEmpty) {
+        return RocketDockImportResult(
+          ok: settingsImported,
+          importedItems: 0,
+          importedSettings: settingsImported,
+          message:
+              'Настройки RocketDock прочитаны, но значков в этом файле не найдено (0 шт.). Если RocketDock хранит ярлыки в Реестре Windows, нажмите «Авто-импорт из RocketDock (Реестр / ПК)».',
+        );
+      }
       return RocketDockImportResult(
         ok: true,
         importedItems: importedList.length,
         importedSettings: settingsImported,
-        message: 'Импортировано из RocketDock 1.3.5: ${importedList.length} значков в Панель $targetDockId.',
+        message:
+            'Импортировано из RocketDock 1.3.5: ${importedList.length} значков в Панель $targetDockId${previewNames.isNotEmpty ? " ($previewNames${importedList.length > 5 ? "…" : ""})" : ""}.',
       );
     } catch (e) {
+      DebugMonitor.log('ERR', 'ini_import', 'Исключение импорта INI: $e');
       return RocketDockImportResult(
         ok: false,
         importedItems: 0,
@@ -1695,6 +1841,70 @@ class PortableIniStore {
         message: 'Ошибка импорта INI: $e',
       );
     }
+  }
+
+  /// Auto-detect and import RocketDock 1.3.5 directly from Windows Registry (`HKCU\Software\RocketDock`)
+  /// OR standard RocketDock installation folders (`C:\Program Files (x86)\RocketDock\Settings.ini`).
+  Future<RocketDockImportResult> autoImportRocketDockFromSystem({
+    required int targetDockId,
+    bool importVisualSettings = true,
+    bool replaceExistingItems = true,
+  }) async {
+    DebugMonitor.log('IMPORT', 'rd_auto', 'Поиск RocketDock 1.3.5 в Реестре Windows и Program Files…');
+
+    // 1. Try Windows Registry HKCU\Software\RocketDock (where 90% of RocketDock 1.3.5 installs store icons!)
+    File? tempReg;
+    try {
+      tempReg = await Win32Bridge.exportRocketDockRegistryToFile(Directory.systemTemp);
+      if (tempReg != null) {
+        DebugMonitor.log('IMPORT', 'rd_auto', 'Найден ключ HKCU\\Software\\RocketDock (${tempReg.lengthSync()} байт)');
+        final res = await importRocketDock135Ini(
+          tempReg,
+          targetDockId: targetDockId,
+          importVisualSettings: importVisualSettings,
+          replaceExistingItems: replaceExistingItems,
+        );
+        if (res.ok && res.importedItems > 0) {
+          return RocketDockImportResult(
+            ok: true,
+            importedItems: res.importedItems,
+            importedSettings: res.importedSettings,
+            message: 'Из Реестра Windows (RocketDock 1.3.5): ${res.message}',
+          );
+        }
+      }
+    } finally {
+      try {
+        if (tempReg != null && tempReg.existsSync()) tempReg.deleteSync();
+      } catch (_) {}
+    }
+
+    // 2. Fallback to Program Files / AppData Settings.ini
+    final installedIni = Win32Bridge.findInstalledRocketDockIni();
+    if (installedIni != null) {
+      DebugMonitor.log('IMPORT', 'rd_auto', 'Найден файл ${installedIni.path}');
+      final res = await importRocketDock135Ini(
+        installedIni,
+        targetDockId: targetDockId,
+        importVisualSettings: importVisualSettings,
+        replaceExistingItems: replaceExistingItems,
+      );
+      return RocketDockImportResult(
+        ok: res.ok,
+        importedItems: res.importedItems,
+        importedSettings: res.importedSettings,
+        message: 'Из ${installedIni.path}: ${res.message}',
+      );
+    }
+
+    DebugMonitor.log('WARN', 'rd_auto', 'RocketDock 1.3.5 не найден ни в Реестре Windows, ни в Program Files');
+    return const RocketDockImportResult(
+      ok: false,
+      importedItems: 0,
+      importedSettings: false,
+      message:
+          'RocketDock 1.3.5 не найден в Реестре Windows (HKCU\\Software\\RocketDock) и в Program Files. Включите в RocketDock «Хранить настройки в INI» или выберите его .ini / .reg файл вручную.',
+    );
   }
 
   DockPanelConfig _parsePanelSection(int id, Map<String, String> s) {
@@ -1779,6 +1989,7 @@ class PortableIniStore {
           ? _bool(g['Dock3Enabled'], false)
           : legacyDockCount >= 3,
       devDockEnabled: _bool(g['DevDockEnabled'], true),
+      debugMode: _bool(g['DebugMode'], false),
       excludedWindows: _list(g['ExcludedWindows']),
       iconFolders: _list(g['IconFolders']).map(fromPortablePath).toList(),
     );
@@ -1852,8 +2063,12 @@ class PortableIniStore {
     }
 
     _lastContentSignature = _computeBytesSignature(bytes);
+    _lastIniSize = bytes.length;
     try {
       lastLoadedModified = await iniFile.lastModified();
+      if (_revTokenFile.existsSync()) {
+        _lastRevToken = _revTokenFile.readAsStringSync().trim();
+      }
     } catch (_) {}
   }
 
@@ -1920,6 +2135,7 @@ class PortableIniStore {
       ..writeln('Dock2Enabled=${global.dock2Enabled ? 1 : 0}')
       ..writeln('Dock3Enabled=${global.dock3Enabled ? 1 : 0}')
       ..writeln('DevDockEnabled=${global.devDockEnabled ? 1 : 0}')
+      ..writeln('DebugMode=${global.debugMode ? 1 : 0}')
       ..writeln('ExcludedWindows=${global.excludedWindows.join('|')}')
       ..writeln('IconFolders=${global.iconFolders.map(toPortablePath).join('|')}')
       ..writeln('')
@@ -2042,7 +2258,14 @@ class PortableIniStore {
             } catch (_) {}
           }
         }
-        _lastContentSignature = _computeBytesSignature(bytes);
+        final sig = _computeBytesSignature(bytes);
+        _lastContentSignature = sig;
+        _lastIniSize = bytes.length;
+        final revTok = '$_revision:$sig';
+        _lastRevToken = revTok;
+        try {
+          _revTokenFile.writeAsStringSync(revTok, flush: false);
+        } catch (_) {}
         try {
           lastLoadedModified = await iniFile.lastModified();
         } catch (_) {}

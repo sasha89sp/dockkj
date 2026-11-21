@@ -259,6 +259,31 @@ final class _Bitmap extends Struct {
   external int bmBits;
 }
 
+final class _ProcessMemoryCountersEx extends Struct {
+  @Uint32()
+  external int cb;
+  @Uint32()
+  external int pageFaultCount;
+  @IntPtr()
+  external int peakWorkingSetSize;
+  @IntPtr()
+  external int workingSetSize;
+  @IntPtr()
+  external int quotaPeakPagedPoolUsage;
+  @IntPtr()
+  external int quotaPagedPoolUsage;
+  @IntPtr()
+  external int quotaPeakNonPagedPoolUsage;
+  @IntPtr()
+  external int quotaNonPagedPoolUsage;
+  @IntPtr()
+  external int pagefileUsage;
+  @IntPtr()
+  external int peakPagefileUsage;
+  @IntPtr()
+  external int privateUsage;
+}
+
 // ============================================================================
 // Data Models Returned by Win32Bridge
 // ============================================================================
@@ -389,6 +414,26 @@ class FolderEntryInfo {
     required this.path,
     required this.isDirectory,
     this.iconPngPath,
+  });
+}
+
+class ProcessResourceMetrics {
+  final int pid;
+  final double cpuPercent;
+  final double workingSetMb;
+  final double privateBytesMb;
+  final int gdiObjects;
+  final int userObjects;
+  final int handleCount;
+
+  const ProcessResourceMetrics({
+    required this.pid,
+    required this.cpuPercent,
+    required this.workingSetMb,
+    required this.privateBytesMb,
+    required this.gdiObjects,
+    required this.userObjects,
+    required this.handleCount,
   });
 }
 
@@ -637,6 +682,35 @@ typedef _GetDIBitsDart = int Function(
     Pointer<_BitmapInfoHeader> lpbmi,
     int usage);
 
+typedef _GetCurrentProcessNative = IntPtr Function();
+typedef _GetCurrentProcessDart = int Function();
+
+typedef _GetProcessTimesNative = Int32 Function(
+    IntPtr hProcess,
+    Pointer<_FileTime> lpCreationTime,
+    Pointer<_FileTime> lpExitTime,
+    Pointer<_FileTime> lpKernelTime,
+    Pointer<_FileTime> lpUserTime);
+typedef _GetProcessTimesDart = int Function(
+    int hProcess,
+    Pointer<_FileTime> lpCreationTime,
+    Pointer<_FileTime> lpExitTime,
+    Pointer<_FileTime> lpKernelTime,
+    Pointer<_FileTime> lpUserTime);
+
+typedef _GetProcessHandleCountNative = Int32 Function(
+    IntPtr hProcess, Pointer<Uint32> pdwHandleCount);
+typedef _GetProcessHandleCountDart = int Function(
+    int hProcess, Pointer<Uint32> pdwHandleCount);
+
+typedef _GetGuiResourcesNative = Uint32 Function(IntPtr hProcess, Uint32 uiFlags);
+typedef _GetGuiResourcesDart = int Function(int hProcess, int uiFlags);
+
+typedef _GetProcessMemoryInfoNative = Int32 Function(
+    IntPtr hProcess, Pointer<_ProcessMemoryCountersEx> ppsmemCounters, Uint32 cb);
+typedef _GetProcessMemoryInfoDart = int Function(
+    int hProcess, Pointer<_ProcessMemoryCountersEx> ppsmemCounters, int cb);
+
 // ============================================================================
 // Ultra-Fast Win32Bridge Implementation (<0.2ms per poll, HD 128px icons)
 // ============================================================================
@@ -730,6 +804,17 @@ class Win32Bridge {
           'GlobalMemoryStatusEx');
   static final _getSystemTimes =
       _kernel32.lookupFunction<_GetSystemTimesNative, _GetSystemTimesDart>('GetSystemTimes');
+  static final _getCurrentProcess =
+      _kernel32.lookupFunction<_GetCurrentProcessNative, _GetCurrentProcessDart>(
+          'GetCurrentProcess');
+  static final _getProcessTimes =
+      _kernel32.lookupFunction<_GetProcessTimesNative, _GetProcessTimesDart>('GetProcessTimes');
+  static final _getProcessHandleCount = _kernel32.lookupFunction<
+      _GetProcessHandleCountNative,
+      _GetProcessHandleCountDart>('GetProcessHandleCount');
+  static final _getGuiResources =
+      _user32.lookupFunction<_GetGuiResourcesNative, _GetGuiResourcesDart>('GetGuiResources');
+  static final _getProcessMemoryInfo = _tryLookupProcessMemoryInfo();
 
   static final _shellExecuteW =
       _shell32.lookupFunction<_ShellExecuteWNative, _ShellExecuteWDart>('ShellExecuteW');
@@ -756,10 +841,29 @@ class Win32Bridge {
   // Cached PID -> (exePath, processName) so EnumWindows avoids OpenProcess every tick!
   static final Map<int, ({String exePath, String processName})> _pidCache = {};
 
-  // CPU delta state
+  // CPU delta state (system & own process)
   static int _lastIdle = 0;
   static int _lastKernel = 0;
   static int _lastUser = 0;
+  static int _lastProcCpu100Ns = 0;
+  static int _lastProcWallUs = 0;
+
+  static _GetProcessMemoryInfoDart? _tryLookupProcessMemoryInfo() {
+    try {
+      return _kernel32.lookupFunction<_GetProcessMemoryInfoNative, _GetProcessMemoryInfoDart>(
+        'K32GetProcessMemoryInfo',
+      );
+    } catch (_) {
+      try {
+        final psapi = DynamicLibrary.open('psapi.dll');
+        return psapi.lookupFunction<_GetProcessMemoryInfoNative, _GetProcessMemoryInfoDart>(
+          'GetProcessMemoryInfo',
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+  }
 
   // Callback state for synchronous EnumWindows / EnumDisplayMonitors
   static final List<int> _enumBuffer = <int>[];
@@ -1599,6 +1703,134 @@ class Win32Bridge {
   static bool isStartupEnabled() {
     final f = _startupLauncherFile();
     return f != null && f.existsSync();
+  }
+
+  /// Query exact CPU %, RAM (WorkingSet + Private), GDI, USER, and OS Handle counts for THIS process.
+  /// Only invoked when DebugMode is enabled!
+  static ProcessResourceMetrics getOwnProcessMetrics() {
+    if (!Platform.isWindows) {
+      return ProcessResourceMetrics(
+        pid: pid,
+        cpuPercent: 0,
+        workingSetMb: 0,
+        privateBytesMb: 0,
+        gdiObjects: 0,
+        userObjects: 0,
+        handleCount: 0,
+      );
+    }
+
+    final hProc = _getCurrentProcess();
+    var cpuPct = 0.0;
+    var wsMb = 0.0;
+    var privMb = 0.0;
+    var gdi = 0;
+    var usr = 0;
+    var handles = 0;
+
+    final cTime = calloc<_FileTime>();
+    final eTime = calloc<_FileTime>();
+    final kTime = calloc<_FileTime>();
+    final uTime = calloc<_FileTime>();
+    final handlePtr = calloc<Uint32>();
+    final memPtr = calloc<_ProcessMemoryCountersEx>();
+
+    try {
+      if (_getProcessTimes(hProc, cTime, eTime, kTime, uTime) != 0) {
+        final proc100Ns = kTime.ref.asUint64 + uTime.ref.asUint64;
+        final nowUs = DateTime.now().microsecondsSinceEpoch;
+        if (_lastProcWallUs > 0 && nowUs > _lastProcWallUs) {
+          final deltaProcUs = (proc100Ns - _lastProcCpu100Ns) / 10.0;
+          final deltaWallUs = (nowUs - _lastProcWallUs).toDouble();
+          final cores = Platform.numberOfProcessors > 0 ? Platform.numberOfProcessors : 1;
+          cpuPct = ((deltaProcUs / (deltaWallUs * cores)) * 100.0).clamp(0.0, 100.0);
+        }
+        _lastProcCpu100Ns = proc100Ns;
+        _lastProcWallUs = nowUs;
+      }
+
+      if (_getProcessHandleCount(hProc, handlePtr) != 0) {
+        handles = handlePtr.value;
+      }
+      gdi = _getGuiResources(hProc, 0);
+      usr = _getGuiResources(hProc, 1);
+
+      final memFn = _getProcessMemoryInfo;
+      if (memFn != null) {
+        memPtr.ref.cb = sizeOf<_ProcessMemoryCountersEx>();
+        if (memFn(hProc, memPtr, sizeOf<_ProcessMemoryCountersEx>()) != 0) {
+          const mb = 1024.0 * 1024.0;
+          wsMb = memPtr.ref.workingSetSize / mb;
+          privMb = memPtr.ref.privateUsage / mb;
+        }
+      }
+    } catch (_) {
+    } finally {
+      calloc.free(cTime);
+      calloc.free(eTime);
+      calloc.free(kTime);
+      calloc.free(uTime);
+      calloc.free(handlePtr);
+      calloc.free(memPtr);
+    }
+
+    return ProcessResourceMetrics(
+      pid: currentPid,
+      cpuPercent: cpuPct,
+      workingSetMb: wsMb,
+      privateBytesMb: privMb,
+      gdiObjects: gdi,
+      userObjects: usr,
+      handleCount: handles,
+    );
+  }
+
+  /// Export installed RocketDock 1.3.5 settings & icons directly from Windows Registry
+  /// (`HKCU\Software\RocketDock`) into a temporary `.reg` file.
+  static Future<File?> exportRocketDockRegistryToFile(Directory tempDir) async {
+    if (!Platform.isWindows) return null;
+    try {
+      if (!tempDir.existsSync()) tempDir.createSync(recursive: true);
+      final outPath = p.join(
+        tempDir.path,
+        'rocketdock_reg_${DateTime.now().millisecondsSinceEpoch}.reg',
+      );
+      for (final regKey in [
+        r'HKCU\Software\RocketDock',
+        r'HKCU\Software\PunkSoftware\RocketDock',
+      ]) {
+        final res = await Process.run(
+          'reg.exe',
+          ['export', regKey, outPath, '/y'],
+          runInShell: false,
+        );
+        final outFile = File(outPath);
+        if (res.exitCode == 0 && outFile.existsSync() && outFile.lengthSync() > 40) {
+          return outFile;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Locate an installed RocketDock 1.3.5 Settings.ini in standard Windows paths.
+  static File? findInstalledRocketDockIni() {
+    if (!Platform.isWindows) return null;
+    final appData = Platform.environment['APPDATA'] ?? '';
+    final localAppData = Platform.environment['LOCALAPPDATA'] ?? '';
+    final candidates = [
+      r'C:\Program Files (x86)\RocketDock\Settings.ini',
+      r'C:\Program Files\RocketDock\Settings.ini',
+      if (appData.isNotEmpty) p.join(appData, 'RocketDock', 'Settings.ini'),
+      if (localAppData.isNotEmpty) p.join(localAppData, 'RocketDock', 'Settings.ini'),
+    ];
+    for (final c in candidates) {
+      try {
+        final f = File(c);
+        if (f.existsSync() && f.lengthSync() > 20) return f;
+      } catch (_) {}
+    }
+    return null;
   }
 
   static Future<bool> setStartupEnabled(bool enable) async {
