@@ -49,18 +49,22 @@ jobs:
       - name: Build Windows Release (.exe)
         run: flutter build windows --release
 
-      - name: Package Portable ZIP
+      - name: Package Portable ZIP (Settings.ini + Skins + Icons + Docklets + Languages)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "dist/AeroDock-Portable" | Out-Null
-          Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" "dist/AeroDock-Portable/"
-          if (Test-Path "aerodock-config.json") {
-            Copy-Item -Force "aerodock-config.json" "dist/AeroDock-Portable/aerodock-config.json"
+          $out = "dist/AeroDock-Portable"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" "$out/"
+          foreach ($dir in @("Skins", "Icons", "Docklets", "Languages")) {
+            New-Item -ItemType Directory -Force -Path "$out/$dir" | Out-Null
+          }
+          if (Test-Path "Settings.ini") {
+            Copy-Item -Force "Settings.ini" "$out/Settings.ini"
           }
           if (Test-Path "README-FLUTTER-RU.txt") {
-            Copy-Item -Force "README-FLUTTER-RU.txt" "dist/AeroDock-Portable/README-RU.txt"
+            Copy-Item -Force "README-FLUTTER-RU.txt" "$out/README-RU.txt"
           }
-          Compress-Archive -Path "dist/AeroDock-Portable/*" -DestinationPath "dist/AeroDock-Windows-Portable-x64.zip" -Force
+          Compress-Archive -Path "$out/*" -DestinationPath "dist/AeroDock-Windows-Portable-x64.zip" -Force
 
       - name: Upload Portable Artifact
         uses: actions/upload-artifact@v4
@@ -78,4 +82,4 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release create $tag "dist/AeroDock-Windows-Portable-x64.zip" `
             --title "AeroDock Portable $tag" `
-            --notes "Портативная сборка AeroDock на Flutter для Windows x64. Распакуйте и запустите aerodock.exe."
+            --notes "Портативная сборка AeroDock v3.0 (Flutter + Native Win32 FFI, 1-3 панели, Settings.ini, Доклеты, Скины, Сворачивание окон). Распакуйте и запустите aerodock.exe."

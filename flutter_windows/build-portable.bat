@@ -1,45 +1,34 @@
 @echo off
 chcp 65001 >nul
-setlocal
+echo ============================================================
+echo   AeroDock Portable v3.0 — Сборка Windows Release (Flutter)
+echo ============================================================
+echo.
 
-echo ======================================================
-echo   Сборка портативной версии AeroDock (Flutter Windows)
-echo ======================================================
-
-where flutter >nul 2>nul
-if errorlevel 1 (
-  echo [ОШИБКА] Flutter SDK не найден в PATH.
-  echo Установите Flutter или соберите в облаке через GitHub Actions.
-  pause
-  exit /b 1
-)
-
+flutter config --enable-windows-desktop
 if not exist "windows" (
-  echo [1/5] Инициализация Windows-раннера Flutter...
-  call flutter create --platforms=windows --project-name aerodock .
-  if errorlevel 1 ( pause & exit /b 1 )
+  flutter create --platforms=windows --project-name aerodock .
 )
+if exist "test\widget_test.dart" del /f /q "test\widget_test.dart"
+if exist "assets\app_icon.ico" copy /y "assets\app_icon.ico" "windows\runner\resources\app_icon.ico" >nul
 
-if exist "assets\app_icon.ico" (
-  echo [2/5] Установка фирменной иконки aerodock.exe...
-  copy /Y "assets\app_icon.ico" "windows\runner\resources\app_icon.ico" >nul
-)
+flutter pub get
+if errorlevel 1 exit /b 1
 
-echo [3/5] Загрузка зависимостей (pub get)...
-call flutter pub get
-if errorlevel 1 ( pause & exit /b 1 )
+flutter build windows --release
+if errorlevel 1 exit /b 1
 
-echo [4/5] Компиляция Release-версии под Windows x64...
-call flutter build windows --release
-if errorlevel 1 ( pause & exit /b 1 )
+if exist "dist\AeroDock-Portable" rmdir /s /q "dist\AeroDock-Portable"
+mkdir "dist\AeroDock-Portable"
+mkdir "dist\AeroDock-Portable\Skins"
+mkdir "dist\AeroDock-Portable\Icons"
+mkdir "dist\AeroDock-Portable\Docklets"
+mkdir "dist\AeroDock-Portable\Languages"
 
-echo [5/5] Упаковка портативной папки AeroDock-Portable-EXE...
-if exist "AeroDock-Portable-EXE" rmdir /s /q "AeroDock-Portable-EXE"
-mkdir "AeroDock-Portable-EXE"
-xcopy /E /I /Y "build\windows\x64\runner\Release\*" "AeroDock-Portable-EXE\" >nul
-copy /Y "aerodock-config.json" "AeroDock-Portable-EXE\aerodock-config.json" >nul
+xcopy /e /i /y "build\windows\x64\runner\Release\*" "dist\AeroDock-Portable\" >nul
+if exist "Settings.ini" copy /y "Settings.ini" "dist\AeroDock-Portable\Settings.ini" >nul
+if exist "README-FLUTTER-RU.txt" copy /y "README-FLUTTER-RU.txt" "dist\AeroDock-Portable\README-RU.txt" >nul
 
 echo.
-echo Готово! Портативная версия собрана в папке: AeroDock-Portable-EXE
-explorer "AeroDock-Portable-EXE"
+echo Готово! Портативная сборка находится в: dist\AeroDock-Portable\aerodock.exe
 pause
