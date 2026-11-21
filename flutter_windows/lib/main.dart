@@ -31,17 +31,70 @@ Future<void> main(List<String> args) async {
   await acrylic.Window.initialize();
 
   var dockId = 1;
+  var isSettingsWindow = false;
+  var settingsTab = 0;
+
   for (final arg in args) {
-    if (arg.startsWith('--dock=')) {
+    if (arg == '--settings') {
+      isSettingsWindow = true;
+    } else if (arg.startsWith('--dock=')) {
       dockId = int.tryParse(arg.substring(7))?.clamp(1, 4) ?? 1;
+    } else if (arg.startsWith('--tab=')) {
+      settingsTab = int.tryParse(arg.substring(6))?.clamp(0, 7) ?? 0;
     }
+  }
+
+  // Dedicated standalone Settings window so ALL docks stay visible for Live Preview!
+  if (isSettingsWindow) {
+    final store = await PortableIniStore.load(allowAutoMigrate: false);
+    AppI18n.loadExternalLanguages(store.languagesDir);
+    AppI18n.currentCode = store.global.language;
+    store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
+
+    var displays = <Display>[];
+    try {
+      displays = await screenRetriever.getAllDisplays();
+    } catch (_) {}
+
+    const settingsOpts = WindowOptions(
+      size: Size(810, 600),
+      center: true,
+      backgroundColor: Colors.transparent,
+      skipTaskbar: false,
+      titleBarStyle: TitleBarStyle.hidden,
+      alwaysOnTop: true,
+    );
+
+    await windowManager.waitUntilReadyToShow(settingsOpts, () async {
+      await windowManager.setAsFrameless();
+      await windowManager.setHasShadow(false);
+      await windowManager.setBackgroundColor(Colors.transparent);
+      await windowManager.setResizable(false);
+      await windowManager.setAlwaysOnTop(true);
+      await acrylic.Window.setEffect(
+        effect: acrylic.WindowEffect.transparent,
+        color: const Color(0x00000000),
+      );
+      await windowManager.show();
+      await windowManager.focus();
+    });
+
+    runApp(
+      SettingsWindowApp(
+        store: store,
+        activeDockId: dockId,
+        initialTab: settingsTab,
+        displays: displays,
+      ),
+    );
+    return;
   }
 
   if (dockId == 1) {
     await hotKeyManager.unregisterAll();
   }
 
-  final store = await PortableIniStore.load();
+  final store = await PortableIniStore.load(allowAutoMigrate: dockId == 1);
   AppI18n.loadExternalLanguages(store.languagesDir);
   AppI18n.currentCode = store.global.language;
   store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
@@ -83,6 +136,107 @@ Future<void> main(List<String> args) async {
   });
 
   runApp(AeroDockApp(store: store, dockId: dockId));
+}
+
+class SettingsWindowApp extends StatelessWidget {
+  final PortableIniStore store;
+  final int activeDockId;
+  final int initialTab;
+  final List<Display> displays;
+
+  const SettingsWindowApp({
+    super.key,
+    required this.store,
+    required this.activeDockId,
+    required this.initialTab,
+    required this.displays,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Настройки AeroDock',
+      theme: ThemeData.dark(useMaterial3: true).copyWith(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF0EA5E9),
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: _StandaloneSettingsHost(
+        store: store,
+        activeDockId: activeDockId,
+        initialTab: initialTab,
+        displays: displays,
+      ),
+    );
+  }
+}
+
+class _StandaloneSettingsHost extends StatefulWidget {
+  final PortableIniStore store;
+  final int activeDockId;
+  final int initialTab;
+  final List<Display> displays;
+
+  const _StandaloneSettingsHost({
+    required this.store,
+    required this.activeDockId,
+    required this.initialTab,
+    required this.displays,
+  });
+
+  @override
+  State<_StandaloneSettingsHost> createState() => _StandaloneSettingsHostState();
+}
+
+class _StandaloneSettingsHostState extends State<_StandaloneSettingsHost> {
+  Timer? _quitWatchTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    final quitFile = File(p.join(widget.store.portableDir.path, '.aerodock_quit'));
+    _quitWatchTimer = Timer.periodic(const Duration(milliseconds: 450), (_) async {
+      if (quitFile.existsSync()) {
+        await windowManager.destroy();
+        exit(0);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _quitWatchTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: Center(
+        child: DockSettingsDialog(
+          store: widget.store,
+          activeDockId: widget.activeDockId,
+          initialTab: widget.initialTab,
+          displays: widget.displays,
+          isStandaloneWindow: true,
+          onSaved: () {},
+          onResetDefaults: () async {
+            await widget.store.resetSettingsToDefaultsOnly();
+          },
+          onFullReset: () async {
+            await widget.store.fullReset();
+          },
+          onClose: () async {
+            await windowManager.destroy();
+            exit(0);
+          },
+        ),
+      ),
+    );
+  }
 }
 
 class AeroDockApp extends StatelessWidget {
@@ -137,8 +291,10 @@ class DockShellPage extends StatefulWidget {
 
 class _DockShellPageState extends State<DockShellPage>
     with TrayListener, WindowListener {
-  // Sibling dock processes (owned by Dock #1)
+  // Sibling dock processes (owned by Dock #1) + standalone Settings window process
   final Map<int, Process> _childDocks = {};
+  Process? _settingsProcess;
+  bool _syncInFlight = false;
 
   // Ultra-fast ValueNotifiers — ZERO full-tree setState() during idle or hover!
   final ValueNotifier<double?> _hoverAxisNotifier = ValueNotifier<double?>(null);
@@ -161,8 +317,9 @@ class _DockShellPageState extends State<DockShellPage>
   bool _suspended = false;
   int _ownHwnd = 0;
 
-  // Cached display rect (eliminates repeated screenRetriever IPC calls!)
+  // Cached logical-DIP display rect + DPI scale factor (prevents off-screen clipping on 125%/150% DPI!)
   Rect _cachedScreenRect = const Rect.fromLTWH(0, 0, 1920, 1040);
+  double _displayScaleFactor = 1.0;
   List<Display> _displays = [];
   List<ExternalSkinInfo> _externalSkins = [];
   List<ExternalDockletInfo> _externalDocklets = [];
@@ -216,9 +373,26 @@ class _DockShellPageState extends State<DockShellPage>
   File get _quitSignalFile => File(p.join(widget.store.portableDir.path, '.aerodock_quit'));
   File get _hiddenSignalFile => File(p.join(widget.store.portableDir.path, '.aerodock_hidden'));
 
-  // Slot geometry constants for zero-reflow continuous cosine wave zoom
-  double get _slotStride => _cfg.iconSize + 12.0;
-  double get _sepStride => 14.0;
+  // Adaptive no-clip slot sizing: automatically fits all icons inside screen width/height
+  // so changing edge (top/left/right/bottom) or increasing icon size NEVER hides icons!
+  double get _fitScaleRatio {
+    final regularCount = _items.where((e) => e.type != 'separator').length +
+        (_isPrimary ? _minimizedWindows.length : 0);
+    if (regularCount <= 0) return 1.0;
+    final sepCount = _items.where((e) => e.type == 'separator').length +
+        (_isPrimary && _minimizedWindows.isNotEmpty ? 1 : 0);
+    final availMain = math.max(
+      200.0,
+      (_isHorizontal ? _cachedScreenRect.width : _cachedScreenRect.height) - 76.0,
+    );
+    final desiredMain = regularCount * (_cfg.iconSize + 12.0) + sepCount * 14.0;
+    if (desiredMain <= availMain) return 1.0;
+    return (availMain / desiredMain).clamp(0.42, 1.0);
+  }
+
+  double get _effectiveIconSize => (_cfg.iconSize * _fitScaleRatio).clamp(24.0, _cfg.iconSize);
+  double get _slotStride => _effectiveIconSize + (12.0 * _fitScaleRatio).clamp(4.0, 12.0);
+  double get _sepStride => (14.0 * _fitScaleRatio).clamp(6.0, 14.0);
 
   @override
   void initState() {
@@ -239,6 +413,11 @@ class _DockShellPageState extends State<DockShellPage>
         await _registerGlobalHotKey();
         await _reconcileSiblingDocks();
         _initDevWatcher();
+        if (widget.store.migratedFromPreviousVersion) {
+          _showToast('Настройки и иконки автоматически перенесены из предыдущей версии!');
+        }
+        // Trigger scheduled auto-backup silently in background
+        unawaited(widget.store.runAutoBackupIfDue());
       }
       _extractMissingIcons();
       _applyLayerAndAcrylic();
@@ -279,8 +458,8 @@ class _DockShellPageState extends State<DockShellPage>
       }
     });
 
-    // 5. Multi-Dock INI/IPC sync every 1.2s (lightweight file mtime check)
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
+    // 5. Ultra-fast Live Settings & Multi-Dock INI sync every 220ms (mtime check < 0.05ms!)
+    _syncTimer = Timer.periodic(const Duration(milliseconds: 220), (_) {
       _checkMultiDockSync();
     });
 
@@ -407,35 +586,44 @@ class _DockShellPageState extends State<DockShellPage>
       } catch (_) {}
     }
     _childDocks.clear();
+    if (_settingsProcess != null) {
+      try {
+        _settingsProcess!.kill();
+      } catch (_) {}
+      _settingsProcess = null;
+    }
   }
 
   Future<void> _checkMultiDockSync() async {
-    if (_quitSignalFile.existsSync()) {
-      await _exitSingleInstance();
-      return;
-    }
-
-    final shouldSuspend = _hiddenSignalFile.existsSync();
-    if (shouldSuspend != _suspended) {
-      _suspended = shouldSuspend;
-      if (_suspended) {
-        await windowManager.hide();
-      } else {
-        await windowManager.show();
-        _applyLayerAndAcrylic();
-        await _syncWindowGeometry();
+    if (_syncInFlight) return;
+    _syncInFlight = true;
+    try {
+      if (_quitSignalFile.existsSync()) {
+        await _exitSingleInstance();
+        return;
       }
-      _reconcileDevWatcher();
-      if (mounted) setState(() {});
-    }
 
-    // Sync Settings.ini across Dock 1..4 whenever multi-dock is active
-    if (widget.store.global.activeDockCount > 1 || !_isPrimary) {
+      final shouldSuspend = _hiddenSignalFile.existsSync();
+      if (shouldSuspend != _suspended) {
+        _suspended = shouldSuspend;
+        if (_suspended) {
+          await windowManager.hide();
+        } else {
+          await windowManager.show();
+          _applyLayerAndAcrylic();
+          await _syncWindowGeometry();
+        }
+        _reconcileDevWatcher();
+        if (mounted) setState(() {});
+      }
+
+      // ALWAYS watch Settings.ini so the standalone Live Settings window updates EVERY dock in real time!
       if (await widget.store.hasExternalChanges()) {
         await widget.store.reloadFromDisk();
         AppI18n.currentCode = widget.store.global.language;
         _externalSkins = widget.store.scanExternalSkins();
         _externalDocklets = widget.store.scanExternalDocklets();
+        if (!_cfg.autoHide) _isAutoHidden = false;
         await _refreshDisplaysAndWorkArea();
         if (_isPrimary) {
           await _reconcileSiblingDocks();
@@ -450,6 +638,8 @@ class _DockShellPageState extends State<DockShellPage>
         await _syncWindowGeometry();
         if (mounted) setState(() {});
       }
+    } finally {
+      _syncInFlight = false;
     }
   }
 
@@ -496,7 +686,9 @@ class _DockShellPageState extends State<DockShellPage>
             MenuItem(key: 'settings', label: '${AppI18n.t('dock_settings')}…'),
             MenuItem(key: 'settings_panels', label: 'Управление панелями (1–3)…'),
             MenuItem(key: 'settings_dev', label: 'Панель «Разработка» (GitHub)…'),
-            MenuItem(key: 'import_rd135', label: 'Импорт RocketDock 1.3.5 (.ini)…'),
+            MenuItem(key: 'settings_backup', label: 'Бэкапы и восстановление…'),
+            MenuItem(key: 'backup_now', label: 'Создать бэкап сейчас'),
+            MenuItem(key: 'import_rd135', label: 'Импорт Settings.ini (RocketDock 1.3.5 / AeroDock)…'),
             MenuItem.separator(),
             MenuItem(key: 'toggle_dock2', label: 'Панель 2 (Справа)${g.dock2Enabled ? ' ✓' : ''}'),
             MenuItem(key: 'toggle_dock3', label: 'Панель 3 (Сверху)${g.dock3Enabled ? ' ✓' : ''}'),
@@ -533,6 +725,14 @@ class _DockShellPageState extends State<DockShellPage>
       case 'settings_dev':
         if (_suspended) await _toggleGlobalSuspend();
         await _openSettingsTab(2);
+        break;
+      case 'settings_backup':
+        if (_suspended) await _toggleGlobalSuspend();
+        await _openSettingsTab(7);
+        break;
+      case 'backup_now':
+        final b = await widget.store.createBackup(tag: 'manual');
+        _showToast(b != null ? 'Бэкап создан: ${b.name}' : 'Не удалось создать бэкап');
         break;
       case 'import_rd135':
         if (_suspended) await _toggleGlobalSuspend();
@@ -728,7 +928,7 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Work-Area Positioning (Sits Cleanly ABOVE Windows Taskbar!)
+  // DPI-Safe Work-Area Positioning (Sits Cleanly ABOVE Windows Taskbar on 100/125/150/200% DPI!)
   // ============================================================================
 
   Future<void> _refreshDisplaysAndWorkArea() async {
@@ -736,27 +936,62 @@ class _DockShellPageState extends State<DockShellPage>
       _displays = await screenRetriever.getAllDisplays();
     } catch (_) {}
 
-    if (_cfg.monitorIndex == -1) {
-      final v = Win32Bridge.getVirtualScreenRect();
-      _cachedScreenRect = Rect.fromLTWH(v.left, v.top, v.width, v.height);
-      return;
-    }
+    if (_displays.isNotEmpty) {
+      final primary = _displays.first;
+      _displayScaleFactor = (primary.scaleFactor?.toDouble() ?? 1.0).clamp(0.75, 4.0);
 
-    // On primary monitor (index 0), SPI_GETWORKAREA gives exact bounds excluding Windows Taskbar!
-    if (_cfg.monitorIndex == 0) {
-      final work = Win32Bridge.getPrimaryWorkArea();
-      if (work != null) {
-        _cachedScreenRect = Rect.fromLTWH(work.left, work.top, work.width, work.height);
-        return;
+      if (_cfg.monitorIndex == -1) {
+        // Monitor * (all displays unified in logical DIPs!)
+        var minL = double.infinity;
+        var minT = double.infinity;
+        var maxR = double.negativeInfinity;
+        var maxB = double.negativeInfinity;
+        for (final d in _displays) {
+          final pos = d.visiblePosition ?? Offset.zero;
+          final sz = d.visibleSize ?? d.size;
+          minL = math.min(minL, pos.dx);
+          minT = math.min(minT, pos.dy);
+          maxR = math.max(maxR, pos.dx + sz.width);
+          maxB = math.max(maxB, pos.dy + sz.height);
+        }
+        if (minL.isFinite && maxR > minL && maxB > minT) {
+          _cachedScreenRect = Rect.fromLTRB(minL, minT, maxR, maxB);
+          return;
+        }
+      } else {
+        final idx = _cfg.monitorIndex.clamp(0, _displays.length - 1);
+        final d = _displays[idx];
+        _displayScaleFactor = (d.scaleFactor?.toDouble() ?? 1.0).clamp(0.75, 4.0);
+        final pos = d.visiblePosition ?? Offset.zero;
+        final sz = d.visibleSize ?? d.size;
+        if (sz.width > 100 && sz.height > 100) {
+          _cachedScreenRect = Rect.fromLTWH(pos.dx, pos.dy, sz.width, sz.height);
+          return;
+        }
       }
     }
 
-    if (_displays.isNotEmpty) {
-      final idx = _cfg.monitorIndex.clamp(0, _displays.length - 1);
-      final d = _displays[idx];
-      final pos = d.visiblePosition ?? Offset.zero;
-      final sz = d.visibleSize ?? d.size;
-      _cachedScreenRect = Rect.fromLTWH(pos.dx, pos.dy, sz.width, sz.height);
+    // Fallback to Win32 physical pixels converted to logical DIPs via _displayScaleFactor
+    final scale = _displayScaleFactor;
+    if (_cfg.monitorIndex == -1) {
+      final v = Win32Bridge.getVirtualScreenRect();
+      _cachedScreenRect = Rect.fromLTWH(
+        v.left / scale,
+        v.top / scale,
+        v.width / scale,
+        v.height / scale,
+      );
+      return;
+    }
+
+    final work = Win32Bridge.getPrimaryWorkArea();
+    if (work != null) {
+      _cachedScreenRect = Rect.fromLTWH(
+        work.left / scale,
+        work.top / scale,
+        work.width / scale,
+        work.height / scale,
+      );
     }
   }
 
@@ -797,11 +1032,11 @@ class _DockShellPageState extends State<DockShellPage>
         _ => 810.0,
       };
       final h = switch (_overlay) {
-        _ActiveOverlay.settings => 590.0,
+        _ActiveOverlay.settings => 600.0,
         _ActiveOverlay.iconSettings => 560.0,
         _ActiveOverlay.stack => 410.0,
         _ActiveOverlay.calendar => 340.0,
-        _ => 590.0,
+        _ => 600.0,
       };
       final left = screen.left + (screen.width - w) / 2;
       final top = screen.top + (screen.height - h) / 2;
@@ -812,22 +1047,23 @@ class _DockShellPageState extends State<DockShellPage>
       return;
     }
 
-    final baseIcon = _cfg.iconSize;
+    final baseIcon = _effectiveIconSize;
     final maxIcon = baseIcon * (_cfg.hoverEffect == 'none' ? 1.0 : _cfg.zoomScale);
-    // Generous horizontal padding so outermost zoomed icons NEVER clip!
-    final mainLen = math.max(240.0, _computeItemsMainSpan() + maxIcon * 1.4 + 48);
-    // Generous vertical headroom above the shelf for zoomed icons + floating label!
-    final crossLen = math.max(maxIcon + (_cfg.showLabels ? 56 : 28) + 20, 146.0);
+    final zoomPad = math.max(36.0, (maxIcon - baseIcon) * 1.3 + 48.0);
+    // Main length fits ALL icons cleanly with zoom headroom and never clips!
+    final mainLen = math.max(220.0, _computeItemsMainSpan() + zoomPad);
+    // Cross length leaves generous room for zoomed icons + floating label!
+    final crossLen = math.max(maxIcon + (_cfg.showLabels ? 58 : 28) + 22, 138.0);
 
     final bool collapsed = _cfg.autoHide && _isAutoHidden;
     final double winW;
     final double winH;
     if (_isHorizontal) {
-      winW = math.min(screen.width - 12, mainLen);
-      winH = collapsed ? 8.0 : math.min(screen.height - 20, crossLen);
+      winW = math.min(screen.width - 8, mainLen);
+      winH = collapsed ? 8.0 : math.min(screen.height - 16, crossLen);
     } else {
-      winW = collapsed ? 8.0 : math.min(screen.width - 20, crossLen + 110);
-      winH = math.min(screen.height - 12, mainLen);
+      winW = collapsed ? 8.0 : math.min(screen.width - 16, crossLen + 110);
+      winH = math.min(screen.height - 8, mainLen);
     }
 
     final centerShiftX = screen.width * (_cfg.centerOffset / 100);
@@ -864,28 +1100,30 @@ class _DockShellPageState extends State<DockShellPage>
     _applyLayerAndAcrylic();
   }
 
-  /// Zero-IPC edge hover detector using cached work area + GetCursorPos.
+  /// Zero-IPC edge hover detector using DPI-aware logical work area + GetCursorPos.
   void _checkCursorEdgeHover() {
     if (_overlay != _ActiveOverlay.none) return;
     if (!_cfg.autoHide && (!_cfg.popupOnMouseover || _cfg.layer == 'top')) return;
 
-    final cursor = Win32Bridge.getCursorPos();
+    final rawCursor = Win32Bridge.getCursorPos();
+    final cx = rawCursor.x / _displayScaleFactor;
+    final cy = rawCursor.y / _displayScaleFactor;
     final screen = _cachedScreenRect;
-    const hotZone = 8.0;
+    const hotZone = 10.0;
 
     final atEdge = switch (_cfg.position) {
-      'top' => cursor.y <= screen.top + hotZone &&
-          cursor.x >= screen.left &&
-          cursor.x <= screen.right,
-      'left' => cursor.x <= screen.left + hotZone &&
-          cursor.y >= screen.top &&
-          cursor.y <= screen.bottom,
-      'right' => cursor.x >= screen.right - hotZone &&
-          cursor.y >= screen.top &&
-          cursor.y <= screen.bottom,
-      _ => cursor.y >= screen.bottom - hotZone &&
-          cursor.x >= screen.left &&
-          cursor.x <= screen.right,
+      'top' => cy <= screen.top + hotZone &&
+          cx >= screen.left &&
+          cx <= screen.right,
+      'left' => cx <= screen.left + hotZone &&
+          cy >= screen.top &&
+          cy <= screen.bottom,
+      'right' => cx >= screen.right - hotZone &&
+          cy >= screen.top &&
+          cy <= screen.bottom,
+      _ => cy >= screen.bottom - hotZone &&
+          cx >= screen.left &&
+          cx <= screen.right,
     };
 
     if (atEdge) {
@@ -1070,14 +1308,15 @@ class _DockShellPageState extends State<DockShellPage>
     final paths = details.files.map((f) => f.path).where((s) => s.isNotEmpty).toList();
     if (paths.isEmpty) return;
 
-    // Auto-import RocketDock 1.3.5 Settings.ini if dropped directly onto the dock!
+    // Auto-import RocketDock 1.3.5 OR AeroDock Settings.ini if dropped directly onto the dock!
     if (paths.length == 1 && p.extension(paths.first).toLowerCase() == '.ini') {
       try {
         final iniFile = File(paths.first);
         final sections = PortableIniStore.parseIniText(
           decodeWindowsIniBytes(await iniFile.readAsBytes()),
         );
-        if (PortableIniStore.isRocketDock135Ini(sections)) {
+        if (PortableIniStore.isRocketDock135Ini(sections) ||
+            PortableIniStore.isAeroDockIni(sections)) {
           final importRes = await widget.store.importRocketDock135Ini(
             iniFile,
             targetDockId: _dockId,
@@ -1145,9 +1384,30 @@ class _DockShellPageState extends State<DockShellPage>
     await _syncWindowGeometry();
   }
 
+  /// Open Settings in a dedicated standalone floating window so ALL docks stay visible on screen
+  /// and update visually in real time as the user adjusts size, edge, theme, or zoom!
   Future<void> _openSettingsTab(int tab) async {
-    _settingsInitialTab = tab;
-    await _openOverlay(_ActiveOverlay.settings);
+    try {
+      await widget.store.save(skipProfileSync: true);
+      if (_settingsProcess != null) {
+        try {
+          _settingsProcess!.kill();
+        } catch (_) {}
+        _settingsProcess = null;
+      }
+      final proc = await Process.start(
+        Platform.resolvedExecutable,
+        ['--settings', '--dock=$_dockId', '--tab=$tab'],
+      );
+      _settingsProcess = proc;
+      proc.exitCode.then((_) {
+        if (_settingsProcess == proc) _settingsProcess = null;
+      });
+    } catch (_) {
+      // Fallback to in-window overlay only if process launch fails
+      _settingsInitialTab = tab;
+      await _openOverlay(_ActiveOverlay.settings);
+    }
   }
 
   Future<void> _openOverlay(_ActiveOverlay next) async {
@@ -1258,11 +1518,15 @@ class _DockShellPageState extends State<DockShellPage>
       const PopupMenuDivider(),
       PopupMenuItem(
         value: 'import_rd135',
-        child: const Text('📥 Импорт RocketDock 1.3.5 (.ini)…'),
+        child: const Text('📥 Импорт Settings.ini (RocketDock 1.3.5 / AeroDock)…'),
       ),
       PopupMenuItem(
         value: 'open_dev_settings',
         child: const Text('⚙ Правила «Разработка» (GitHub)…'),
+      ),
+      PopupMenuItem(
+        value: 'open_backup_settings',
+        child: const Text('💾 Бэкапы и восстановление…'),
       ),
       PopupMenuItem(
         value: 'toggle_lock',
@@ -1533,6 +1797,9 @@ class _DockShellPageState extends State<DockShellPage>
         break;
       case 'open_dev_settings':
         await _openSettingsTab(2);
+        break;
+      case 'open_backup_settings':
+        await _openSettingsTab(7);
         break;
       case 'open_settings':
         await _openSettingsTab(0);
@@ -1879,7 +2146,7 @@ class _DockShellPageState extends State<DockShellPage>
       }
     }
 
-    final shelfCross = _cfg.iconSize * 0.72 + 12;
+    final shelfCross = _effectiveIconSize * 0.72 + 12;
 
     return Stack(
       clipBehavior: Clip.none,
@@ -2053,13 +2320,14 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   Widget _buildDividerVisual() {
+    final base = _effectiveIconSize;
     return SizedBox(
-      width: _isHorizontal ? _sepStride : _cfg.iconSize,
-      height: _isHorizontal ? _cfg.iconSize : _sepStride,
+      width: _isHorizontal ? _sepStride : base,
+      height: _isHorizontal ? base : _sepStride,
       child: Center(
         child: Container(
-          width: _isHorizontal ? 1.5 : _cfg.iconSize * 0.65,
-          height: _isHorizontal ? _cfg.iconSize * 0.65 : 1.5,
+          width: _isHorizontal ? 1.5 : base * 0.65,
+          height: _isHorizontal ? base * 0.65 : 1.5,
           decoration: BoxDecoration(
             color: Colors.white.withValues(alpha: 0.30),
             borderRadius: BorderRadius.circular(2),
@@ -2076,6 +2344,61 @@ class _DockShellPageState extends State<DockShellPage>
         _ => Alignment.bottomCenter,
       };
 
+  Widget _buildRunningDot(String? exe) {
+    final showDot = widget.store.global.showRunningIndicators && exe != null;
+    return SizedBox(
+      width: _isHorizontal ? null : 7,
+      height: _isHorizontal ? 7 : null,
+      child: showDot
+          ? ValueListenableBuilder<Set<String>>(
+              valueListenable: _runningProcsNotifier,
+              builder: (_, running, __) {
+                if (!running.contains(exe)) return const SizedBox.shrink();
+                return Center(
+                  child: Container(
+                    width: 5,
+                    height: 5,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF38BDF8),
+                      shape: BoxShape.circle,
+                      boxShadow: [BoxShadow(color: Color(0xCC38BDF8), blurRadius: 5)],
+                    ),
+                  ),
+                );
+              },
+            )
+          : null,
+    );
+  }
+
+  Widget _alignSlotWithEdge(Widget iconArt, Widget indicator) {
+    switch (_cfg.position) {
+      case 'top':
+        return Column(
+          mainAxisAlignment: MainAxisAlignment.start,
+          children: [indicator, iconArt],
+        );
+      case 'left':
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [indicator, iconArt],
+        );
+      case 'right':
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [iconArt, indicator],
+        );
+      case 'bottom':
+      default:
+        return Column(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [iconArt, indicator],
+        );
+    }
+  }
+
   Widget _buildRegularSlot(int index, DockItemModel item, double wave) {
     if (item.type == 'separator') {
       return GestureDetector(
@@ -2084,7 +2407,7 @@ class _DockShellPageState extends State<DockShellPage>
       );
     }
 
-    final base = _cfg.iconSize;
+    final base = _effectiveIconSize;
     final scale = _cfg.hoverEffect == 'bubble'
         ? 1.0 + (_cfg.zoomScale - 1.0) * wave
         : 1.0;
@@ -2109,6 +2432,18 @@ class _DockShellPageState extends State<DockShellPage>
 
     final exe = item.executableName;
 
+    final art = Opacity(
+      opacity: effectiveOpacity,
+      child: Transform.translate(
+        offset: Offset(dx, dy),
+        child: Transform.scale(
+          scale: scale * (isBouncing && _cfg.clickEffect == 'pulse' ? 1.12 : 1.0),
+          alignment: _zoomAnchor,
+          child: _renderItemArt(item, base),
+        ),
+      ),
+    );
+
     final tile = SizedBox(
       width: _isHorizontal ? _slotStride : base + 10,
       height: _isHorizontal ? base + 10 : _slotStride,
@@ -2116,45 +2451,7 @@ class _DockShellPageState extends State<DockShellPage>
         behavior: HitTestBehavior.opaque,
         onTap: () => _activateItem(item),
         onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition, item: item),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.end,
-          children: [
-            Opacity(
-              opacity: effectiveOpacity,
-              child: Transform.translate(
-                offset: Offset(dx, dy),
-                child: Transform.scale(
-                  scale: scale * (isBouncing && _cfg.clickEffect == 'pulse' ? 1.12 : 1.0),
-                  alignment: _zoomAnchor,
-                  child: _renderItemArt(item, base),
-                ),
-              ),
-            ),
-            // Running indicator driven by isolated ValueListenableBuilder!
-            SizedBox(
-              height: 7,
-              child: (widget.store.global.showRunningIndicators && exe != null)
-                  ? ValueListenableBuilder<Set<String>>(
-                      valueListenable: _runningProcsNotifier,
-                      builder: (_, running, __) {
-                        if (!running.contains(exe)) return const SizedBox.shrink();
-                        return Center(
-                          child: Container(
-                            width: 5,
-                            height: 5,
-                            decoration: const BoxDecoration(
-                              color: Color(0xFF38BDF8),
-                              shape: BoxShape.circle,
-                              boxShadow: [BoxShadow(color: Color(0xCC38BDF8), blurRadius: 5)],
-                            ),
-                          ),
-                        );
-                      },
-                    )
-                  : null,
-            ),
-          ],
-        ),
+        child: _alignSlotWithEdge(art, _buildRunningDot(exe)),
       ),
     );
 
@@ -2199,11 +2496,22 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   Widget _buildMinimizedWindowSlot(int minIdx, _MinimizedWindowEntry entry, double wave) {
-    final base = _cfg.iconSize;
+    final base = _effectiveIconSize;
     final scale = _cfg.hoverEffect == 'bubble'
         ? 1.0 + (_cfg.zoomScale - 1.0) * wave
         : 1.0;
     final liftPx = _cfg.hoverEffect == 'none' ? 0.0 : wave * (base * 0.16);
+
+    final dx = switch (_cfg.position) {
+      'left' => liftPx,
+      'right' => -liftPx,
+      _ => 0.0,
+    };
+    final dy = switch (_cfg.position) {
+      'top' => liftPx,
+      'bottom' => -liftPx,
+      _ => 0.0,
+    };
 
     final iconWidget = SizedBox(
       width: base,
@@ -2246,6 +2554,15 @@ class _DockShellPageState extends State<DockShellPage>
       ),
     );
 
+    final transformed = Transform.translate(
+      offset: Offset(dx, dy),
+      child: Transform.scale(
+        scale: scale,
+        alignment: _zoomAnchor,
+        child: iconWidget,
+      ),
+    );
+
     final tile = SizedBox(
       width: _isHorizontal ? _slotStride : base + 10,
       height: _isHorizontal ? base + 10 : _slotStride,
@@ -2253,19 +2570,9 @@ class _DockShellPageState extends State<DockShellPage>
         behavior: HitTestBehavior.opaque,
         onTap: () => _restoreMinimizedEntry(entry),
         onSecondaryTapDown: (d) => _showDockContextMenu(d.globalPosition, minWin: entry),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.end,
-          children: [
-            Transform.translate(
-              offset: Offset(0, -liftPx),
-              child: Transform.scale(
-                scale: scale,
-                alignment: _zoomAnchor,
-                child: iconWidget,
-              ),
-            ),
-            const SizedBox(height: 7),
-          ],
+        child: _alignSlotWithEdge(
+          transformed,
+          SizedBox(width: _isHorizontal ? null : 7, height: _isHorizontal ? 7 : null),
         ),
       ),
     );

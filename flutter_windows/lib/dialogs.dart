@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:screen_retriever/screen_retriever.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'dev_watcher.dart';
 import 'docklets.dart';
@@ -21,6 +23,7 @@ class DockSettingsDialog extends StatefulWidget {
   final int initialTab;
   final List<Display> displays;
   final DevArchiveWatcher? devWatcher;
+  final bool isStandaloneWindow;
   final VoidCallback onSaved;
   final VoidCallback onResetDefaults;
   final VoidCallback onFullReset;
@@ -33,6 +36,7 @@ class DockSettingsDialog extends StatefulWidget {
     this.initialTab = 0,
     required this.displays,
     this.devWatcher,
+    this.isStandaloneWindow = false,
     required this.onSaved,
     required this.onResetDefaults,
     required this.onFullReset,
@@ -48,20 +52,30 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
   late int _editingDockId;
   late GlobalDockSettings _global;
   late DevDockSettings _dev;
+  late BackupSettings _backup;
   late Map<int, DockPanelConfig> _panels;
   late List<ExternalSkinInfo> _skins;
+  List<BackupEntry> _backups = [];
 
-  // RocketDock 1.3.5 INI import state
+  // Live preview & Cancel rollback snapshot
+  String? _initialIniSnapshot;
+  Timer? _liveSaveTimer;
+  bool _liveDirty = false;
+  bool _applyingLive = false;
+  bool _pendingLive = false;
+
+  // RocketDock 1.3.5 / AeroDock INI import state
   int _rdImportTargetDock = 1;
   bool _rdImportVisuals = true;
   bool _rdImportReplace = true;
   String? _statusBanner;
   bool _statusIsError = false;
 
-  // Dev Panel controllers & add-rule form
+  // Dev Panel & Backup controllers + add-rule form
   late TextEditingController _watchFolderCtrl;
   late TextEditingController _appsRootCtrl;
   late TextEditingController _preserveExtsCtrl;
+  late TextEditingController _backupFolderCtrl;
 
   bool _showAddRuleForm = false;
   final TextEditingController _ruleNameCtrl = TextEditingController();
@@ -81,6 +95,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     _rdImportTargetDock = widget.activeDockId.clamp(1, 4);
     _global = widget.store.global.copy();
     _dev = widget.store.devSettings.copy();
+    _backup = widget.store.backupSettings.copy();
     _panels = {
       1: (widget.store.panels[1] ?? DockPanelConfig.defaultFor(1)).copy(),
       2: (widget.store.panels[2] ?? DockPanelConfig.defaultFor(2)).copy(),
@@ -88,17 +103,27 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       4: (widget.store.panels[4] ?? DockPanelConfig.defaultFor(4)).copy(),
     };
     _skins = widget.store.scanExternalSkins();
+    _backups = widget.store.listBackups();
+
+    try {
+      if (widget.store.iniFile.existsSync()) {
+        _initialIniSnapshot = widget.store.iniFile.readAsStringSync();
+      }
+    } catch (_) {}
 
     _watchFolderCtrl = TextEditingController(text: _dev.watchFolder);
     _appsRootCtrl = TextEditingController(text: _dev.appsRootFolder);
     _preserveExtsCtrl = TextEditingController(text: _dev.defaultPreserveExts);
+    _backupFolderCtrl = TextEditingController(text: _backup.backupFolder);
   }
 
   @override
   void dispose() {
+    _liveSaveTimer?.cancel();
     _watchFolderCtrl.dispose();
     _appsRootCtrl.dispose();
     _preserveExtsCtrl.dispose();
+    _backupFolderCtrl.dispose();
     _ruleNameCtrl.dispose();
     _rulePrefixCtrl.dispose();
     _ruleExeCtrl.dispose();
@@ -106,7 +131,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     super.dispose();
   }
 
-  void _syncDevControllersToDraft() {
+  void _syncTextControllersToDraft() {
     if (_watchFolderCtrl.text.trim().isNotEmpty) {
       _dev.watchFolder = _watchFolderCtrl.text.trim();
     }
@@ -116,12 +141,54 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     if (_preserveExtsCtrl.text.trim().isNotEmpty) {
       _dev.defaultPreserveExts = _preserveExtsCtrl.text.trim();
     }
+    if (_backupFolderCtrl.text.trim().isNotEmpty) {
+      _backup.backupFolder = _backupFolderCtrl.text.trim();
+    }
+  }
+
+  /// Debounced real-time apply so all open docks visually update while dragging sliders/buttons!
+  void _scheduleLiveApply({bool immediate = false}) {
+    _liveDirty = true;
+    _liveSaveTimer?.cancel();
+    if (immediate) {
+      _applyLiveNow();
+    } else {
+      _liveSaveTimer = Timer(const Duration(milliseconds: 80), _applyLiveNow);
+    }
+  }
+
+  Future<void> _applyLiveNow() async {
+    if (_applyingLive) {
+      _pendingLive = true;
+      return;
+    }
+    _applyingLive = true;
+    try {
+      _syncTextControllersToDraft();
+      widget.store.global = _global.copy();
+      widget.store.devSettings = _dev.copy();
+      widget.store.backupSettings = _backup.copy();
+      for (var id = 1; id <= 4; id++) {
+        widget.store.panels[id] = _panels[id]!.copy();
+      }
+      AppI18n.currentCode = _global.language;
+      await widget.store.save(skipProfileSync: true);
+      widget.onSaved();
+    } finally {
+      _applyingLive = false;
+      if (_pendingLive) {
+        _pendingLive = false;
+        _applyLiveNow();
+      }
+    }
   }
 
   Future<void> _persistDraftToStore() async {
-    _syncDevControllersToDraft();
+    _liveSaveTimer?.cancel();
+    _syncTextControllersToDraft();
     widget.store.global = _global.copy();
     widget.store.devSettings = _dev.copy();
+    widget.store.backupSettings = _backup.copy();
     for (var id = 1; id <= 4; id++) {
       widget.store.panels[id] = _panels[id]!.copy();
     }
@@ -133,7 +200,63 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
 
   Future<void> _saveAndClose() async {
     await _persistDraftToStore();
+    _liveDirty = false;
     widget.onClose();
+  }
+
+  Future<void> _cancelAndRevert() async {
+    _liveSaveTimer?.cancel();
+    if (_liveDirty && _initialIniSnapshot != null) {
+      try {
+        await widget.store.iniFile.writeAsString(_initialIniSnapshot!, flush: true);
+        await widget.store.reloadFromDisk();
+        widget.onSaved();
+      } catch (_) {}
+    }
+    widget.onClose();
+  }
+
+  Future<void> _createBackupNow() async {
+    await _persistDraftToStore();
+    final created = await widget.store.createBackup(tag: 'manual');
+    if (!mounted) return;
+    setState(() {
+      _backup = widget.store.backupSettings.copy();
+      _backups = widget.store.listBackups();
+    });
+    if (created != null) {
+      _setBanner('Бэкап создан: ${created.name} (${(created.sizeBytes / 1024).ceil()} КБ)');
+    } else {
+      _setBanner('Не удалось создать бэкап. Проверьте права доступа к папке бэкапов.', isError: true);
+    }
+  }
+
+  Future<void> _restoreBackup(BackupEntry entry) async {
+    final ok = await widget.store.restoreBackup(entry.path);
+    if (!mounted) return;
+    if (ok) {
+      setState(() {
+        _global = widget.store.global.copy();
+        _dev = widget.store.devSettings.copy();
+        _backup = widget.store.backupSettings.copy();
+        _watchFolderCtrl.text = _dev.watchFolder;
+        _appsRootCtrl.text = _dev.appsRootFolder;
+        _preserveExtsCtrl.text = _dev.defaultPreserveExts;
+        _backupFolderCtrl.text = _backup.backupFolder;
+        for (var id = 1; id <= 4; id++) {
+          _panels[id] = (widget.store.panels[id] ?? DockPanelConfig.defaultFor(id)).copy();
+        }
+        _backups = widget.store.listBackups();
+        _liveDirty = false;
+      });
+      try {
+        _initialIniSnapshot = widget.store.iniFile.readAsStringSync();
+      } catch (_) {}
+      widget.onSaved();
+      _setBanner('Настройки и значки восстановлены из бэкапа: ${entry.name}');
+    } else {
+      _setBanner('Не удалось восстановить бэкап ${entry.name}.', isError: true);
+    }
   }
 
   void _setBanner(String message, {bool isError = false}) {
@@ -169,12 +292,19 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       for (var id = 1; id <= 4; id++) {
         _panels[id] = (widget.store.panels[id] ?? DockPanelConfig.defaultFor(id)).copy();
       }
+      if (importRes.ok) {
+        _backups = widget.store.listBackups();
+      }
       _statusBanner = importRes.message;
       _statusIsError = !importRes.ok;
     });
     if (importRes.ok) {
       widget.store.global = _global.copy();
       await widget.store.save();
+      try {
+        _initialIniSnapshot = widget.store.iniFile.readAsStringSync();
+      } catch (_) {}
+      _liveDirty = false;
       widget.onSaved();
     }
   }
@@ -288,12 +418,12 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       (Icons.desktop_windows_rounded, AppI18n.t('tab_position')),
       (Icons.palette_rounded, AppI18n.t('tab_style')),
       (Icons.flash_on_rounded, AppI18n.t('tab_behavior')),
-      (Icons.folder_special_rounded, AppI18n.t('tab_about')),
+      (Icons.backup_rounded, 'Бэкап и сброс'),
     ];
 
     return Container(
-      width: 780,
-      height: 560,
+      width: 790,
+      height: 580,
       decoration: BoxDecoration(
         color: const Color(0xF70F172A),
         borderRadius: BorderRadius.circular(18),
@@ -304,91 +434,117 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
       ),
       child: Column(
         children: [
-          // Header with Dock 1 / 2 / 3 / Разработка profile switcher
-          Container(
-            height: 52,
-            padding: const EdgeInsets.symmetric(horizontal: 14),
-            decoration: const BoxDecoration(
-              border: Border(bottom: BorderSide(color: Color(0x1FFFFFFF))),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.rocket_launch_rounded, color: Color(0xFF38BDF8), size: 18),
-                const SizedBox(width: 8),
-                Text(
-                  AppI18n.t('dock_settings'),
-                  style: const TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.white,
+          // Header with Dock 1 / 2 / 3 / Разработка profile switcher (draggable when standalone)
+          GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onPanStart: widget.isStandaloneWindow
+                ? (_) => windowManager.startDragging()
+                : null,
+            child: Container(
+              height: 52,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: const BoxDecoration(
+                border: Border(bottom: BorderSide(color: Color(0x1FFFFFFF))),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.rocket_launch_rounded, color: Color(0xFF38BDF8), size: 18),
+                  const SizedBox(width: 8),
+                  Text(
+                    AppI18n.t('dock_settings'),
+                    style: const TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
                   ),
-                ),
-                const Spacer(),
-                Container(
-                  padding: const EdgeInsets.all(3),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.06),
-                    borderRadius: BorderRadius.circular(9),
-                    border: Border.all(color: Colors.white12),
+                  const SizedBox(width: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: const Color(0x2210B981),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: const Color(0x5534D399)),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.circle, size: 7, color: Color(0xFF34D399)),
+                        SizedBox(width: 5),
+                        Text(
+                          'Живой предпросмотр',
+                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFF6EE7B7)),
+                        ),
+                      ],
+                    ),
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (var id = 1; id <= 4; id++)
-                        GestureDetector(
-                          onTap: () => setState(() => _editingDockId = id),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: _editingDockId == id
-                                  ? (id == 4
-                                      ? const Color(0xFF7C3AED)
-                                      : const Color(0xFF0284C7))
-                                  : Colors.transparent,
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Container(
-                                  width: 6,
-                                  height: 6,
-                                  margin: const EdgeInsets.only(right: 5),
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: _global.isDockEnabled(id)
-                                        ? (id == 4
-                                            ? const Color(0xFFC4B5FD)
-                                            : const Color(0xFF34D399))
-                                        : Colors.white24,
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.06),
+                      borderRadius: BorderRadius.circular(9),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (var id = 1; id <= 4; id++)
+                          GestureDetector(
+                            onTap: () => setState(() => _editingDockId = id),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: _editingDockId == id
+                                    ? (id == 4
+                                        ? const Color(0xFF7C3AED)
+                                        : const Color(0xFF0284C7))
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(
+                                    width: 6,
+                                    height: 6,
+                                    margin: const EdgeInsets.only(right: 5),
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: _global.isDockEnabled(id)
+                                          ? (id == 4
+                                              ? const Color(0xFFC4B5FD)
+                                              : const Color(0xFF34D399))
+                                          : Colors.white24,
+                                    ),
                                   ),
-                                ),
-                                Text(
-                                  _dockShortLabel(id),
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                    color: _editingDockId == id
-                                        ? Colors.white
-                                        : (_global.isDockEnabled(id)
-                                            ? Colors.white70
-                                            : Colors.white38),
+                                  Text(
+                                    _dockShortLabel(id),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: _editingDockId == id
+                                          ? Colors.white
+                                          : (_global.isDockEnabled(id)
+                                              ? Colors.white70
+                                              : Colors.white38),
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(width: 6),
-                IconButton(
-                  onPressed: widget.onClose,
-                  icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
-                  splashRadius: 16,
-                ),
-              ],
+                  const SizedBox(width: 6),
+                  IconButton(
+                    onPressed: _cancelAndRevert,
+                    icon: const Icon(Icons.close_rounded, size: 18, color: Colors.white70),
+                    splashRadius: 16,
+                  ),
+                ],
+              ),
             ),
           ),
 
@@ -546,7 +702,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                 ),
                 const Spacer(),
                 TextButton(
-                  onPressed: widget.onClose,
+                  onPressed: _cancelAndRevert,
                   child: Text(
                     AppI18n.t('cancel'),
                     style: const TextStyle(fontSize: 12, color: Colors.white70),
@@ -596,14 +752,14 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   Icon(Icons.file_upload_rounded, size: 17, color: Color(0xFF38BDF8)),
                   SizedBox(width: 7),
                   Text(
-                    'Импорт Settings.ini из оригинального RocketDock 1.3.5',
+                    'Импорт Settings.ini (RocketDock 1.3.5 и AeroDock)',
                     style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: Colors.white),
                   ),
                 ],
               ),
               const SizedBox(height: 5),
               const Text(
-                'Загружает ярлыки, иконки, параметры запуска и оформление напрямую из RocketDock 1.3.5 (поддержка UTF-16, UTF-8 и кириллицы Windows-1251). Также можно просто перетащить файл Settings.ini на панель.',
+                'Загружает ярлыки, иконки и оформление из оригинального RocketDock 1.3.5 (любые секции [RocketDock] / [Icons] / UTF-16 / Windows-1251) или из другого Settings.ini AeroDock. Также можно перетащить .ini прямо на панель.',
                 style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.35),
               ),
               const SizedBox(height: 10),
@@ -686,7 +842,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               .map((e) => DropdownMenuItem(value: e.key, child: Text('${e.value} (${e.key})')))
               .toList(),
           onChanged: (v) {
-            if (v != null) setState(() => _global.language = v);
+            if (v != null) {
+              setState(() => _global.language = v);
+              _scheduleLiveApply(immediate: true);
+            }
           },
         ),
         const SizedBox(height: 14),
@@ -701,37 +860,55 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           AppI18n.t('portable_ini'),
           'Все настройки и ярлыки хранятся в Settings.ini рядом с aerodock.exe',
           _global.portableIni,
-          (v) => setState(() => _global.portableIni = v),
+          (v) {
+            setState(() => _global.portableIni = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('minimize_to_dock'),
           'Свёрнутые окна попадают в панель (Ctrl+Alt+Shift — исключить навсегда, Ctrl — один раз)',
           _global.minimizeToDock,
-          (v) => setState(() => _global.minimizeToDock = v),
+          (v) {
+            setState(() => _global.minimizeToDock = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('disable_min_anim'),
           'Мгновенное скрытие окна в док без задержки анимации Windows',
           _global.disableMinimizeAnimation,
-          (v) => setState(() => _global.disableMinimizeAnimation = v),
+          (v) {
+            setState(() => _global.disableMinimizeAnimation = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('running_indicators'),
           'Светящаяся точка рядом с иконками запущенных программ',
           _global.showRunningIndicators,
-          (v) => setState(() => _global.showRunningIndicators = v),
+          (v) {
+            setState(() => _global.showRunningIndicators = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('open_running'),
           'При клике активировать уже открытое окно вместо запуска копии',
           _global.openRunningInstance,
-          (v) => setState(() => _global.openRunningInstance = v),
+          (v) {
+            setState(() => _global.openRunningInstance = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           AppI18n.t('lock_items'),
           'Защита от случайного перемещения/удаления (удерживайте Ctrl для обхода)',
           _global.lockItems,
-          (v) => setState(() => _global.lockItems = v),
+          (v) {
+            setState(() => _global.lockItems = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
       ],
     );
@@ -765,7 +942,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           enabled: _global.dock2Enabled,
           canToggle: true,
           accent: const Color(0xFF34D399),
-          onToggle: (v) => setState(() => _global.dock2Enabled = v),
+          onToggle: (v) {
+            setState(() => _global.dock2Enabled = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _buildPanelToggleCard(
           dockId: 3,
@@ -774,7 +954,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           enabled: _global.dock3Enabled,
           canToggle: true,
           accent: const Color(0xFFFBBF24),
-          onToggle: (v) => setState(() => _global.dock3Enabled = v),
+          onToggle: (v) {
+            setState(() => _global.dock3Enabled = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _buildPanelToggleCard(
           dockId: 4,
@@ -783,7 +966,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           enabled: _global.devDockEnabled,
           canToggle: true,
           accent: const Color(0xFFA78BFA),
-          onToggle: (v) => setState(() => _global.devDockEnabled = v),
+          onToggle: (v) {
+            setState(() => _global.devDockEnabled = v);
+            _scheduleLiveApply(immediate: true);
+          },
           extraActionLabel: 'Правила GitHub →',
           onExtraAction: () => setState(() => _tab = 2),
         ),
@@ -867,7 +1053,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   padding: const EdgeInsets.only(right: 5),
                   child: InkWell(
                     borderRadius: BorderRadius.circular(6),
-                    onTap: () => setState(() => panel.position = pos.$1),
+                    onTap: () {
+                      setState(() => panel.position = pos.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       decoration: BoxDecoration(
@@ -1259,7 +1448,7 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
     );
   }
 
-  // ---- TAB 3: Icons ----
+  // ---- TAB 3: Icons (with Real-Time Live Preview) ----
   Widget _buildIconsTab() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1275,7 +1464,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   child: _choiceChip(
                     label: q.$2,
                     selected: _cfg.renderQuality == q.$1,
-                    onTap: () => setState(() => _cfg.renderQuality = q.$1),
+                    onTap: () {
+                      setState(() => _cfg.renderQuality = q.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                   ),
                 ),
               ),
@@ -1288,13 +1480,19 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.iconOpacity,
           20,
           100,
-          (v) => setState(() => _cfg.iconOpacity = v),
+          (v) {
+            setState(() => _cfg.iconOpacity = v);
+            _scheduleLiveApply();
+          },
         ),
         _switchRow(
           'Zoom Opaque (100% при наведении)',
           'Делать значок полностью непрозрачным во время увеличения',
           _cfg.zoomOpaque,
-          (v) => setState(() => _cfg.zoomOpaque = v),
+          (v) {
+            setState(() => _cfg.zoomOpaque = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _sliderRow(
           'Базовый размер иконок',
@@ -1302,7 +1500,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.iconSize,
           32,
           96,
-          (v) => setState(() => _cfg.iconSize = v),
+          (v) {
+            setState(() => _cfg.iconSize = v);
+            _scheduleLiveApply();
+          },
         ),
         const SizedBox(height: 8),
         _sectionTitle('Эффект при наведении (Hover Effect)'),
@@ -1316,7 +1517,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   child: _choiceChip(
                     label: h.$2,
                     selected: _cfg.hoverEffect == h.$1,
-                    onTap: () => setState(() => _cfg.hoverEffect = h.$1),
+                    onTap: () {
+                      setState(() => _cfg.hoverEffect = h.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                   ),
                 ),
               ),
@@ -1329,7 +1533,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.zoomScale,
           1.0,
           2.2,
-          (v) => setState(() => _cfg.zoomScale = v),
+          (v) {
+            setState(() => _cfg.zoomScale = v);
+            _scheduleLiveApply();
+          },
         ),
         _sliderRow(
           'Ширина волны зума (Zoom Width)',
@@ -1337,7 +1544,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.zoomWidth,
           1.0,
           6.0,
-          (v) => setState(() => _cfg.zoomWidth = v),
+          (v) {
+            setState(() => _cfg.zoomWidth = v);
+            _scheduleLiveApply();
+          },
         ),
         _sliderRow(
           'Длительность зума (Zoom Duration)',
@@ -1345,13 +1555,16 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.zoomDurationMs.toDouble(),
           60,
           400,
-          (v) => setState(() => _cfg.zoomDurationMs = v.round()),
+          (v) {
+            setState(() => _cfg.zoomDurationMs = v.round());
+            _scheduleLiveApply();
+          },
         ),
       ],
     );
   }
 
-  // ---- TAB 4: Position ----
+  // ---- TAB 4: Position (with Real-Time Live Preview) ----
   Widget _buildPositionTab() {
     final monitorOptions = <DropdownMenuItem<int>>[
       DropdownMenuItem(value: -1, child: Text(AppI18n.t('monitor_all'))),
@@ -1380,7 +1593,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           decoration: _inputDeco(),
           items: monitorOptions,
           onChanged: (v) {
-            if (v != null) setState(() => _cfg.monitorIndex = v);
+            if (v != null) {
+              setState(() => _cfg.monitorIndex = v);
+              _scheduleLiveApply(immediate: true);
+            }
           },
         ),
         const SizedBox(height: 16),
@@ -1401,7 +1617,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   child: _choiceChip(
                     label: pos.$2,
                     selected: _cfg.position == pos.$1,
-                    onTap: () => setState(() => _cfg.position = pos.$1),
+                    onTap: () {
+                      setState(() => _cfg.position = pos.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                   ),
                 ),
               ),
@@ -1424,7 +1643,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   child: _choiceChip(
                     label: layer.$2,
                     selected: _cfg.layer == layer.$1,
-                    onTap: () => setState(() => _cfg.layer = layer.$1),
+                    onTap: () {
+                      setState(() => _cfg.layer = layer.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                   ),
                 ),
               ),
@@ -1438,7 +1660,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.centerOffset,
           -40,
           40,
-          (v) => setState(() => _cfg.centerOffset = v),
+          (v) {
+            setState(() => _cfg.centerOffset = v);
+            _scheduleLiveApply();
+          },
         ),
         _sliderRow(
           'Отступ от края (Edge Offset)',
@@ -1446,13 +1671,16 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.edgeOffset,
           0,
           64,
-          (v) => setState(() => _cfg.edgeOffset = v),
+          (v) {
+            setState(() => _cfg.edgeOffset = v);
+            _scheduleLiveApply();
+          },
         ),
       ],
     );
   }
 
-  // ---- TAB 5: Style (Skins + Font + Shadow + Outline) ----
+  // ---- TAB 5: Style (Skins + Font + Shadow + Outline with Live Preview) ----
   Widget _buildStyleTab() {
     final builtInThemes = [
       ('aero3d', 'Аэро 3D Полка'),
@@ -1495,7 +1723,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           decoration: _inputDeco(),
           items: allThemeItems,
           onChanged: (v) {
-            if (v != null) setState(() => _cfg.theme = v);
+            if (v != null) {
+              setState(() => _cfg.theme = v);
+              _scheduleLiveApply(immediate: true);
+            }
           },
         ),
         const SizedBox(height: 4),
@@ -1511,19 +1742,28 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.bgOpacity,
           0,
           100,
-          (v) => setState(() => _cfg.bgOpacity = v),
+          (v) {
+            setState(() => _cfg.bgOpacity = v);
+            _scheduleLiveApply();
+          },
         ),
         _switchRow(
           'Эффект размытия Windows Acrylic',
           'Включить системное размытие стекла за подложкой',
           _cfg.useAcrylic,
-          (v) => setState(() => _cfg.useAcrylic = v),
+          (v) {
+            setState(() => _cfg.useAcrylic = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _switchRow(
           'Показывать подписи иконок',
           'Отображать всплывающее имя ярлыка при наведении',
           _cfg.showLabels,
-          (v) => setState(() => _cfg.showLabels = v),
+          (v) {
+            setState(() => _cfg.showLabels = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         const SizedBox(height: 10),
 
@@ -1544,7 +1784,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                     .map((f) => DropdownMenuItem(value: f, child: Text(f)))
                     .toList(),
                 onChanged: (v) {
-                  if (v != null) setState(() => _cfg.labelFontFamily = v);
+                  if (v != null) {
+                    setState(() => _cfg.labelFontFamily = v);
+                    _scheduleLiveApply(immediate: true);
+                  }
                 },
               ),
             ),
@@ -1553,7 +1796,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               child: _choiceChip(
                 label: 'Жирный',
                 selected: _cfg.labelBold,
-                onTap: () => setState(() => _cfg.labelBold = !_cfg.labelBold),
+                onTap: () {
+                  setState(() => _cfg.labelBold = !_cfg.labelBold);
+                  _scheduleLiveApply(immediate: true);
+                },
               ),
             ),
             const SizedBox(width: 6),
@@ -1561,7 +1807,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
               child: _choiceChip(
                 label: 'Курсив',
                 selected: _cfg.labelItalic,
-                onTap: () => setState(() => _cfg.labelItalic = !_cfg.labelItalic),
+                onTap: () {
+                  setState(() => _cfg.labelItalic = !_cfg.labelItalic);
+                  _scheduleLiveApply(immediate: true);
+                },
               ),
             ),
           ],
@@ -1573,32 +1822,50 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.labelFontSize,
           9,
           24,
-          (v) => setState(() => _cfg.labelFontSize = v),
+          (v) {
+            setState(() => _cfg.labelFontSize = v);
+            _scheduleLiveApply();
+          },
         ),
-        _colorRow('Цвет текста', _cfg.labelColor, swatchHexes, (c) => setState(() => _cfg.labelColor = c)),
-        _colorRow('Цвет тени', _cfg.labelShadowColor, swatchHexes, (c) => setState(() => _cfg.labelShadowColor = c)),
+        _colorRow('Цвет текста', _cfg.labelColor, swatchHexes, (c) {
+          setState(() => _cfg.labelColor = c);
+          _scheduleLiveApply(immediate: true);
+        }),
+        _colorRow('Цвет тени', _cfg.labelShadowColor, swatchHexes, (c) {
+          setState(() => _cfg.labelShadowColor = c);
+          _scheduleLiveApply(immediate: true);
+        }),
         _sliderRow(
           'Прозрачность тени',
           '${_cfg.labelShadowOpacity.round()}%',
           _cfg.labelShadowOpacity,
           0,
           100,
-          (v) => setState(() => _cfg.labelShadowOpacity = v),
+          (v) {
+            setState(() => _cfg.labelShadowOpacity = v);
+            _scheduleLiveApply();
+          },
         ),
-        _colorRow('Цвет обводки', _cfg.labelOutlineColor, swatchHexes, (c) => setState(() => _cfg.labelOutlineColor = c)),
+        _colorRow('Цвет обводки', _cfg.labelOutlineColor, swatchHexes, (c) {
+          setState(() => _cfg.labelOutlineColor = c);
+          _scheduleLiveApply(immediate: true);
+        }),
         _sliderRow(
           'Прозрачность обводки',
           '${_cfg.labelOutlineOpacity.round()}%',
           _cfg.labelOutlineOpacity,
           0,
           100,
-          (v) => setState(() => _cfg.labelOutlineOpacity = v),
+          (v) {
+            setState(() => _cfg.labelOutlineOpacity = v);
+            _scheduleLiveApply();
+          },
         ),
       ],
     );
   }
 
-  // ---- TAB 6: Behavior ----
+  // ---- TAB 6: Behavior (with Live Preview) ----
   Widget _buildBehaviorTab() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1619,7 +1886,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
                   child: _choiceChip(
                     label: ef.$2,
                     selected: _cfg.clickEffect == ef.$1,
-                    onTap: () => setState(() => _cfg.clickEffect = ef.$1),
+                    onTap: () {
+                      setState(() => _cfg.clickEffect = ef.$1);
+                      _scheduleLiveApply(immediate: true);
+                    },
                   ),
                 ),
               ),
@@ -1631,7 +1901,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           'Автоскрытие панели (AutoHide)',
           'Скрывать панель у края экрана и показывать при подведении курсора',
           _cfg.autoHide,
-          (v) => setState(() => _cfg.autoHide = v),
+          (v) {
+            setState(() => _cfg.autoHide = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _sliderRow(
           'Длительность скрытия/появления',
@@ -1639,7 +1912,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.autoHideDurationMs.toDouble(),
           60,
           1000,
-          (v) => setState(() => _cfg.autoHideDurationMs = v.round()),
+          (v) {
+            setState(() => _cfg.autoHideDurationMs = v.round());
+            _scheduleLiveApply();
+          },
         ),
         _sliderRow(
           'Задержка автоскрытия',
@@ -1647,7 +1923,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.autoHideDelayMs.toDouble(),
           0,
           2000,
-          (v) => setState(() => _cfg.autoHideDelayMs = v.round()),
+          (v) {
+            setState(() => _cfg.autoHideDelayMs = v.round());
+            _scheduleLiveApply();
+          },
         ),
         const SizedBox(height: 10),
 
@@ -1655,7 +1934,10 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           'Всплытие поверх окон при наведении (Popup on Mouseover)',
           'Временно поднимать панель со слоем «Обычный»/«Под окнами», когда курсор у края экрана',
           _cfg.popupOnMouseover,
-          (v) => setState(() => _cfg.popupOnMouseover = v),
+          (v) {
+            setState(() => _cfg.popupOnMouseover = v);
+            _scheduleLiveApply(immediate: true);
+          },
         ),
         _sliderRow(
           'Задержка всплытия поверх окон',
@@ -1663,24 +1945,217 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
           _cfg.popupDelayMs.toDouble(),
           0,
           2000,
-          (v) => setState(() => _cfg.popupDelayMs = v.round()),
+          (v) {
+            setState(() => _cfg.popupDelayMs = v.round());
+            _scheduleLiveApply();
+          },
         ),
       ],
     );
   }
 
-  // ---- TAB 7: About, Portable Folders & Reset ----
+  // ---- TAB 7: Auto-Backup, Seamless Upgrade & Reset ----
   Widget _buildAboutDefaultsTab() {
+    String fmtDate(DateTime dt) =>
+        '${dt.day.toString().padLeft(2, '0')}.${dt.month.toString().padLeft(2, '0')}.${dt.year} '
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _sectionTitle('AeroDock Portable v3.5 (RocketDock 1.3.5 INI + Dev Panel)'),
+        // Seamless upgrade + Auto-backup card
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0x2210B981),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0x6634D399)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.shield_rounded, size: 17, color: Color(0xFF34D399)),
+                  const SizedBox(width: 7),
+                  const Expanded(
+                    child: Text(
+                      'Бэкапы и сохранение настроек при обновлении',
+                      style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: Colors.white),
+                    ),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: _createBackupNow,
+                    icon: const Icon(Icons.save_alt_rounded, size: 14),
+                    label: const Text('Создать бэкап сейчас', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: const Color(0xFF020617),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _switchRow(
+                'Автоперенос настроек при копировании новой версии в новую папку',
+                'Зеркалирует Settings.ini и иконки в профиль Windows — новая версия в новой папке подхватит всё сама!',
+                _backup.autoSyncProfile,
+                (v) {
+                  setState(() => _backup.autoSyncProfile = v);
+                  _scheduleLiveApply(immediate: true);
+                },
+              ),
+              _switchRow(
+                'Автоматический бэкап программы',
+                'Сохраняет резервные копии Settings.ini, пользовательских иконок и языков (также перед импортом и сбросом)',
+                _backup.autoBackupEnabled,
+                (v) {
+                  setState(() => _backup.autoBackupEnabled = v);
+                  _scheduleLiveApply(immediate: true);
+                },
+              ),
+              const SizedBox(height: 6),
+              _fieldLabel('Периодичность автобэкапа'),
+              Row(
+                children: [
+                  for (final opt in [(0, 'При запуске'), (24, 'Раз в день'), (168, 'Раз в неделю')])
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: _choiceChip(
+                          label: opt.$2,
+                          selected: _backup.autoBackupIntervalHours == opt.$1,
+                          onTap: () {
+                            setState(() => _backup.autoBackupIntervalHours = opt.$1);
+                            _scheduleLiveApply(immediate: true);
+                          },
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              _sliderRow(
+                'Хранить последних бэкапов',
+                '${_backup.maxAutoBackups} шт.',
+                _backup.maxAutoBackups.toDouble(),
+                2,
+                30,
+                (v) {
+                  setState(() => _backup.maxAutoBackups = v.round());
+                  _scheduleLiveApply();
+                },
+              ),
+              _fieldLabel('Папка для хранения бэкапов'),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _backupFolderCtrl,
+                      style: const TextStyle(fontSize: 11.5, color: Colors.white),
+                      decoration: _inputDeco(hint: r'C:\Users\...\Documents\AeroDock-Backups'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  _smallBtn('Обзор…', () async {
+                    final d = await FilePicker.platform.getDirectoryPath();
+                    if (d != null) {
+                      setState(() {
+                        _backupFolderCtrl.text = d;
+                        _backup.backupFolder = d;
+                        widget.store.backupSettings.backupFolder = d;
+                        _backups = widget.store.listBackups();
+                      });
+                      _scheduleLiveApply(immediate: true);
+                    }
+                  }),
+                  const SizedBox(width: 4),
+                  _smallBtn('Открыть', () {
+                    final dir = Directory(_backupFolderCtrl.text.trim());
+                    if (!dir.existsSync()) dir.createSync(recursive: true);
+                    Win32Bridge.shellExecute(target: dir.path);
+                  }),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+
+        // Saved Backups List (1-click Restore)
+        Row(
+          children: [
+            Expanded(child: _sectionTitle('Сохранённые бэкапы (${_backups.length})')),
+            TextButton.icon(
+              onPressed: () {
+                widget.store.backupSettings.backupFolder = _backupFolderCtrl.text.trim();
+                setState(() => _backups = widget.store.listBackups());
+              },
+              icon: const Icon(Icons.refresh_rounded, size: 14, color: Color(0xFF7DD3FC)),
+              label: const Text('Обновить список', style: TextStyle(fontSize: 11, color: Color(0xFF7DD3FC))),
+            ),
+          ],
+        ),
         const SizedBox(height: 6),
+        if (_backups.isEmpty)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: const Color(0x281E293B),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: const Text(
+              'Бэкапов пока нет. Нажмите «Создать бэкап сейчас» или дождитесь автоматического сохранения.',
+              style: TextStyle(fontSize: 11, color: Colors.white60),
+            ),
+          )
+        else
+          for (final b in _backups.take(8))
+            Container(
+              margin: const EdgeInsets.only(bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0x331E293B),
+                borderRadius: BorderRadius.circular(9),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.history_rounded, size: 15, color: Color(0xFF34D399)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          b.name,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: Colors.white),
+                        ),
+                        Text(
+                          '${fmtDate(b.createdAt)} · ${(b.sizeBytes / 1024).ceil()} КБ',
+                          style: const TextStyle(fontSize: 10, color: Colors.white54),
+                        ),
+                      ],
+                    ),
+                  ),
+                  _smallBtn('Восстановить', () => _restoreBackup(b)),
+                ],
+              ),
+            ),
+
+        const SizedBox(height: 16),
+        _sectionTitle('AeroDock Portable v3.6 — Портативные папки'),
+        const SizedBox(height: 4),
         Text(
-          'Портативная папка: ${widget.store.portableDir.path}',
+          'Текущая папка: ${widget.store.portableDir.path}',
           style: const TextStyle(fontSize: 11, color: Color(0xFF7DD3FC)),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 8),
         Wrap(
           spacing: 8,
           runSpacing: 8,
@@ -1691,26 +2166,28 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
             _folderBtn('Docklets/', widget.store.dockletsDir.path),
             _folderBtn('Languages/', widget.store.languagesDir.path),
             _folderBtn('DevApps/', _dev.appsRootFolder),
+            _folderBtn('Бэкапы/', _backup.backupFolder),
           ],
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 14),
         _sectionTitle('Горячие клавиши'),
         const SizedBox(height: 6),
         const Text(
-          '• Ctrl + Alt + R — полностью скрыть/показать все панели (с остановкой отрисовки)\n'
+          '• Ctrl + Alt + R — полностью скрыть/показать все панели\n'
           '• Ctrl + перетаскивание — переместить или удалить значок при включённой блокировке\n'
           '• Ctrl + Alt + Shift при сворачивании окна — навсегда исключить окно из дока\n'
           '• Ctrl при сворачивании окна — однократно свернуть в панель задач Windows\n'
-          '• Drag-n-drop файла Settings.ini из RocketDock 1.3.5 на панель — мгновенный импорт',
-          style: TextStyle(fontSize: 11.5, color: Colors.white70, height: 1.5),
+          '• Drag-n-drop файла Settings.ini (RocketDock 1.3.5 или AeroDock) на панель — импорт',
+          style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.45),
         ),
-        const SizedBox(height: 18),
-        _sectionTitle('Сброс настроек'),
+        const SizedBox(height: 16),
+        _sectionTitle('Сброс настроек (автоматически создаёт бэкап перед сбросом)'),
         const SizedBox(height: 8),
         Row(
           children: [
             ElevatedButton.icon(
-              onPressed: () {
+              onPressed: () async {
+                await widget.store.createBackup(tag: 'pre_reset');
                 widget.onResetDefaults();
                 widget.onClose();
               },
@@ -1723,7 +2200,8 @@ class _DockSettingsDialogState extends State<DockSettingsDialog> {
             ),
             const SizedBox(width: 8),
             ElevatedButton.icon(
-              onPressed: () {
+              onPressed: () async {
+                await widget.store.createBackup(tag: 'pre_full_reset');
                 widget.onFullReset();
                 widget.onClose();
               },

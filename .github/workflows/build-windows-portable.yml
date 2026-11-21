@@ -49,7 +49,7 @@ jobs:
       - name: Build Windows Release (.exe)
         run: flutter build windows --release
 
-      - name: Package Portable ZIP (Settings.ini + Skins + Icons + Docklets + Languages + DevApps)
+      - name: Package Portable ZIP (Zero-Loss Upgrade: Settings.default.ini + Skins + Icons + Docklets + Languages + DevApps)
         shell: pwsh
         run: |
           $out = "dist/AeroDock-Portable"
@@ -58,8 +58,10 @@ jobs:
           foreach ($dir in @("Skins", "Icons", "Docklets", "Languages", "DevApps")) {
             New-Item -ItemType Directory -Force -Path "$out/$dir" | Out-Null
           }
+          # Ship Settings.default.ini (NOT Settings.ini) so extracting a new version over an old folder
+          # NEVER overwrites user settings, and extracting into a new folder auto-migrates from ProfileSync!
           if (Test-Path "Settings.ini") {
-            Copy-Item -Force "Settings.ini" "$out/Settings.ini"
+            Copy-Item -Force "Settings.ini" "$out/Settings.default.ini"
           }
           if (Test-Path "README-FLUTTER-RU.txt") {
             Copy-Item -Force "README-FLUTTER-RU.txt" "$out/README-RU.txt"
@@ -82,4 +84,4 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release create $tag "dist/AeroDock-Windows-Portable-x64.zip" `
             --title "AeroDock Portable $tag" `
-            --notes "Портативная сборка AeroDock v3.5 (RocketDock 1.3.5 INI импорт, независимые панели 1-3, панель «Разработка» с перехватом архивов GitHub, бэкапами и переносом настроек). Распакуйте и запустите aerodock.exe."
+            --notes "Портативная сборка AeroDock v3.6: универсальный импорт Settings.ini (RocketDock 1.3.5 + AeroDock), живой предпросмотр настроек в отдельном окне, DPI-безопасное позиционирование без скрытия иконок, автоперенос настроек при обновлении в новую папку и автобэкап с восстановлением."

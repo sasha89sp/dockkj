@@ -28,13 +28,16 @@ const List<int> _cp1251High = [
 ];
 
 String decodeWindowsIniBytes(List<int> bytes) {
+  if (bytes.isEmpty) return '';
+  String clean(String s) => s.replaceAll('\uFEFF', '').replaceAll('\x00', '');
+
   if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
     // UTF-16LE with BOM (common in RocketDock 1.3.5)
     final units = <int>[];
     for (var i = 2; i + 1 < bytes.length; i += 2) {
       units.add(bytes[i] | (bytes[i + 1] << 8));
     }
-    return String.fromCharCodes(units);
+    return clean(String.fromCharCodes(units));
   }
   if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
     // UTF-16BE with BOM
@@ -42,20 +45,35 @@ String decodeWindowsIniBytes(List<int> bytes) {
     for (var i = 2; i + 1 < bytes.length; i += 2) {
       units.add((bytes[i] << 8) | bytes[i + 1]);
     }
-    return String.fromCharCodes(units);
+    return clean(String.fromCharCodes(units));
+  }
+  // Detect BOM-less UTF-16LE (common when edited/exported on Windows: ASCII chars have 0x00 in odd positions)
+  if (bytes.length >= 8) {
+    var oddZeros = 0;
+    final sample = bytes.length < 80 ? bytes.length : 80;
+    for (var i = 1; i < sample; i += 2) {
+      if (bytes[i] == 0) oddZeros++;
+    }
+    if (oddZeros >= (sample ~/ 4)) {
+      final units = <int>[];
+      for (var i = 0; i + 1 < bytes.length; i += 2) {
+        units.add(bytes[i] | (bytes[i + 1] << 8));
+      }
+      return clean(String.fromCharCodes(units));
+    }
   }
   if (bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
-    return utf8.decode(bytes.sublist(3), allowMalformed: true);
+    return clean(utf8.decode(bytes.sublist(3), allowMalformed: true));
   }
   try {
-    return utf8.decode(bytes, allowMalformed: false);
+    return clean(utf8.decode(bytes, allowMalformed: false));
   } catch (_) {
     // Fallback to Windows-1251 (Cyrillic ANSI)
     final units = List<int>.generate(
       bytes.length,
       (i) => bytes[i] < 0x80 ? bytes[i] : _cp1251High[bytes[i] - 0x80],
     );
-    return String.fromCharCodes(units);
+    return clean(String.fromCharCodes(units));
   }
 }
 
@@ -491,10 +509,64 @@ class RocketDockImportResult {
 }
 
 // ============================================================================
-// Portable Settings.ini Store + RocketDock 1.3.5 Importer
+// Auto-Backup & Seamless Upgrade Profile Sync Settings
+// ============================================================================
+
+class BackupSettings {
+  bool autoBackupEnabled;
+  int autoBackupIntervalHours; // 0 = every launch, 24 = daily, 168 = weekly
+  int maxAutoBackups;
+  String backupFolder;
+  bool autoSyncProfile; // Automatically preserve settings when copying new version to a new folder
+  String lastBackupIso;
+
+  BackupSettings({
+    this.autoBackupEnabled = true,
+    this.autoBackupIntervalHours = 24,
+    this.maxAutoBackups = 10,
+    required this.backupFolder,
+    this.autoSyncProfile = true,
+    this.lastBackupIso = '',
+  });
+
+  BackupSettings copy() => BackupSettings(
+        autoBackupEnabled: autoBackupEnabled,
+        autoBackupIntervalHours: autoBackupIntervalHours,
+        maxAutoBackups: maxAutoBackups,
+        backupFolder: backupFolder,
+        autoSyncProfile: autoSyncProfile,
+        lastBackupIso: lastBackupIso,
+      );
+
+  static BackupSettings defaults() {
+    final userProfile = Platform.environment['USERPROFILE'] ?? r'C:\Users';
+    return BackupSettings(
+      backupFolder: p.join(userProfile, 'Documents', 'AeroDock-Backups'),
+    );
+  }
+}
+
+class BackupEntry {
+  final String name;
+  final String path;
+  final DateTime createdAt;
+  final int sizeBytes;
+
+  const BackupEntry({
+    required this.name,
+    required this.path,
+    required this.createdAt,
+    required this.sizeBytes,
+  });
+}
+
+// ============================================================================
+// Portable Settings.ini Store + RocketDock 1.3.5 Importer + Auto-Backup
 // ============================================================================
 
 class PortableIniStore {
+  static const String _appDirToken = r'$APP_DIR$';
+
   final Directory portableDir;
   final File iniFile;
   final Directory skinsDir;
@@ -505,10 +577,12 @@ class PortableIniStore {
 
   GlobalDockSettings global;
   DevDockSettings devSettings;
+  BackupSettings backupSettings;
   final Map<int, DockPanelConfig> panels;
   final Map<int, List<DockItemModel>> dockItems;
 
   DateTime? lastLoadedModified;
+  bool migratedFromPreviousVersion = false;
 
   PortableIniStore({
     required this.portableDir,
@@ -520,6 +594,7 @@ class PortableIniStore {
     required this.dockletsDir,
     required this.global,
     required this.devSettings,
+    required this.backupSettings,
     required this.panels,
     required this.dockItems,
     this.lastLoadedModified,
@@ -533,7 +608,54 @@ class PortableIniStore {
     return Directory.current;
   }
 
-  static Future<PortableIniStore> load() async {
+  static Directory resolveProfileSyncDir() {
+    final localAppData = Platform.environment['LOCALAPPDATA'] ??
+        Platform.environment['APPDATA'] ??
+        Platform.environment['USERPROFILE'] ??
+        r'C:\Users';
+    return Directory(p.join(localAppData, 'AeroDockPortable', 'ProfileSync'));
+  }
+
+  /// Convert any path inside portableDir to `$APP_DIR$\...` so copying/moving folder preserves everything!
+  String toPortablePath(String rawPath) {
+    final trimmed = rawPath.trim();
+    if (trimmed.isEmpty) return '';
+    final base = portableDir.path;
+    if (trimmed.toLowerCase() == base.toLowerCase()) return _appDirToken;
+    final prefix = base.endsWith(r'\') || base.endsWith('/') ? base : '$base\\';
+    if (trimmed.toLowerCase().startsWith(prefix.toLowerCase())) {
+      final rel = trimmed.substring(prefix.length);
+      return '$_appDirToken\\$rel';
+    }
+    return trimmed;
+  }
+
+  /// Expand `$APP_DIR$\...` (and auto-repair stale AeroDock portable paths copied from an older folder).
+  String fromPortablePath(String rawPath) {
+    final trimmed = rawPath.trim();
+    if (trimmed.isEmpty) return '';
+    if (trimmed.startsWith(_appDirToken)) {
+      final rest = trimmed.substring(_appDirToken.length).replaceFirst(RegExp(r'^[\\/]+'), '');
+      return rest.isEmpty ? portableDir.path : p.join(portableDir.path, rest);
+    }
+    // If user copied Settings.ini from an old AeroDock folder, auto-remap DevApps / Icons / Skins if missing at old path
+    if (!File(trimmed).existsSync() && !Directory(trimmed).existsSync()) {
+      final lower = trimmed.toLowerCase();
+      for (final sub in [r'\icons\', r'\skins\', r'\docklets\', r'\languages\', r'\devapps']) {
+        final idx = lower.indexOf(sub);
+        if (idx >= 0) {
+          final rel = trimmed.substring(idx + 1);
+          final candidate = p.join(portableDir.path, rel);
+          if (sub == r'\devapps' || File(candidate).existsSync() || Directory(candidate).existsSync()) {
+            return candidate;
+          }
+        }
+      }
+    }
+    return trimmed;
+  }
+
+  static Future<PortableIniStore> load({bool allowAutoMigrate = true}) async {
     final dir = resolvePortableDir();
     final iniFile = File(p.join(dir.path, 'Settings.ini'));
     final skinsDir = Directory(p.join(dir.path, 'Skins'));
@@ -556,6 +678,7 @@ class PortableIniStore {
       dockletsDir: dockletsDir,
       global: GlobalDockSettings.defaults(),
       devSettings: DevDockSettings.defaults(dir),
+      backupSettings: BackupSettings.defaults(),
       panels: {
         1: DockPanelConfig.defaultFor(1),
         2: DockPanelConfig.defaultFor(2),
@@ -572,10 +695,197 @@ class PortableIniStore {
 
     if (await iniFile.exists()) {
       await store.reloadFromDisk();
+    } else if (allowAutoMigrate && await store._tryRestoreFromProfileSync()) {
+      store.migratedFromPreviousVersion = true;
+      await store.reloadFromDisk();
+      await store.save();
     } else {
       await store.save();
     }
     return store;
+  }
+
+  Future<bool> _tryRestoreFromProfileSync() async {
+    try {
+      final syncDir = resolveProfileSyncDir();
+      final syncIni = File(p.join(syncDir.path, 'Settings.ini'));
+      if (!syncIni.existsSync()) return false;
+      await syncIni.copy(iniFile.path);
+      final syncIcons = Directory(p.join(syncDir.path, 'Icons'));
+      if (syncIcons.existsSync()) {
+        await _copyDirFiles(syncIcons, iconsDir, skipSubdir: 'cache');
+      }
+      final syncLangs = Directory(p.join(syncDir.path, 'Languages'));
+      if (syncLangs.existsSync()) {
+        await _copyDirFiles(syncLangs, languagesDir);
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _syncToUserProfile() async {
+    if (!backupSettings.autoSyncProfile) return;
+    try {
+      final syncDir = resolveProfileSyncDir();
+      if (!syncDir.existsSync()) syncDir.createSync(recursive: true);
+      if (iniFile.existsSync()) {
+        await iniFile.copy(p.join(syncDir.path, 'Settings.ini'));
+      }
+      if (iconsDir.existsSync()) {
+        await _copyDirFiles(iconsDir, Directory(p.join(syncDir.path, 'Icons')), skipSubdir: 'cache');
+      }
+      if (languagesDir.existsSync()) {
+        await _copyDirFiles(languagesDir, Directory(p.join(syncDir.path, 'Languages')));
+      }
+    } catch (_) {}
+  }
+
+  /// Create a full timestamped backup of Settings.ini + custom Icons + Languages.
+  Future<BackupEntry?> createBackup({String tag = 'manual'}) async {
+    try {
+      final root = Directory(backupSettings.backupFolder);
+      if (!root.existsSync()) root.createSync(recursive: true);
+      final now = DateTime.now();
+      final stamp =
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}_${now.hour.toString().padLeft(2, '0')}-${now.minute.toString().padLeft(2, '0')}-${now.second.toString().padLeft(2, '0')}';
+      final folderName = 'Backup_${stamp}_$tag';
+      final dst = Directory(p.join(root.path, folderName));
+      await dst.create(recursive: true);
+
+      if (iniFile.existsSync()) {
+        await iniFile.copy(p.join(dst.path, 'Settings.ini'));
+      }
+      if (iconsDir.existsSync()) {
+        await _copyDirFiles(iconsDir, Directory(p.join(dst.path, 'Icons')), skipSubdir: 'cache');
+      }
+      if (languagesDir.existsSync()) {
+        await _copyDirFiles(languagesDir, Directory(p.join(dst.path, 'Languages')));
+      }
+
+      backupSettings.lastBackupIso = now.toIso8601String();
+      _pruneBackups(root, backupSettings.maxAutoBackups);
+      await save(skipProfileSync: true);
+
+      return BackupEntry(
+        name: folderName,
+        path: dst.path,
+        createdAt: now,
+        sizeBytes: _dirSizeBytes(dst),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Run automatic backup on launch if enabled and due according to interval.
+  Future<BackupEntry?> runAutoBackupIfDue() async {
+    if (!backupSettings.autoBackupEnabled) return null;
+    final intervalHours = backupSettings.autoBackupIntervalHours;
+    if (intervalHours > 0 && backupSettings.lastBackupIso.isNotEmpty) {
+      final last = DateTime.tryParse(backupSettings.lastBackupIso);
+      if (last != null && DateTime.now().difference(last).inHours < intervalHours) {
+        return null;
+      }
+    }
+    return createBackup(tag: 'auto');
+  }
+
+  List<BackupEntry> listBackups() {
+    final result = <BackupEntry>[];
+    try {
+      final root = Directory(backupSettings.backupFolder);
+      if (!root.existsSync()) return result;
+      for (final entity in root.listSync(followLinks: false)) {
+        if (entity is! Directory) continue;
+        final ini = File(p.join(entity.path, 'Settings.ini'));
+        if (!ini.existsSync()) continue;
+        final stat = ini.statSync();
+        result.add(
+          BackupEntry(
+            name: p.basename(entity.path),
+            path: entity.path,
+            createdAt: stat.modified,
+            sizeBytes: _dirSizeBytes(entity),
+          ),
+        );
+      }
+      result.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    } catch (_) {}
+    return result;
+  }
+
+  Future<bool> restoreBackup(String backupDirPath) async {
+    try {
+      final srcDir = Directory(backupDirPath);
+      final srcIni = File(p.join(srcDir.path, 'Settings.ini'));
+      if (!srcIni.existsSync()) return false;
+      await srcIni.copy(iniFile.path);
+      final srcIcons = Directory(p.join(srcDir.path, 'Icons'));
+      if (srcIcons.existsSync()) {
+        await _copyDirFiles(srcIcons, iconsDir, skipSubdir: 'cache');
+      }
+      final srcLangs = Directory(p.join(srcDir.path, 'Languages'));
+      if (srcLangs.existsSync()) {
+        await _copyDirFiles(srcLangs, languagesDir);
+      }
+      await reloadFromDisk();
+      await save();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> _copyDirFiles(
+    Directory src,
+    Directory dst, {
+    String? skipSubdir,
+  }) async {
+    if (!src.existsSync()) return;
+    if (!dst.existsSync()) await dst.create(recursive: true);
+    await for (final entity in src.list(recursive: false, followLinks: false)) {
+      final name = p.basename(entity.path);
+      if (skipSubdir != null && name.toLowerCase() == skipSubdir.toLowerCase()) continue;
+      final destPath = p.join(dst.path, name);
+      if (entity is Directory) {
+        await _copyDirFiles(entity, Directory(destPath));
+      } else if (entity is File) {
+        try {
+          if (await entity.length() <= 10 * 1024 * 1024) {
+            await entity.copy(destPath);
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  static void _pruneBackups(Directory root, int maxKeep) {
+    try {
+      final dirs = root
+          .listSync(followLinks: false)
+          .whereType<Directory>()
+          .where((d) => File(p.join(d.path, 'Settings.ini')).existsSync())
+          .toList();
+      if (dirs.length <= maxKeep) return;
+      dirs.sort((a, b) => b.path.compareTo(a.path));
+      for (var i = maxKeep; i < dirs.length; i++) {
+        try {
+          dirs[i].deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  static int _dirSizeBytes(Directory dir) {
+    var total = 0;
+    try {
+      for (final e in dir.listSync(recursive: true, followLinks: false)) {
+        if (e is File) total += e.lengthSync();
+      }
+    } catch (_) {}
+    return total;
   }
 
   Future<bool> hasExternalChanges() async {
@@ -608,23 +918,38 @@ class PortableIniStore {
     return sections;
   }
 
-  /// Detect if an INI file is an original RocketDock 1.3.5 Settings.ini file.
+  /// Detect if an INI file is an original RocketDock 1.3.5 Settings.ini (or AeroDock Settings.ini).
   static bool isRocketDock135Ini(Map<String, Map<String, String>> sections) {
-    for (final sec in sections.keys) {
-      final lower = sec.toLowerCase();
+    for (final entry in sections.entries) {
+      final lower = entry.key.toLowerCase();
       if (lower == 'rocketdock' ||
+          lower == 'rocketdock-settings' ||
           lower == r'software\rocketdock' ||
           lower == r'rocketdock\icons' ||
           lower == r'software\rocketdock\icons' ||
-          lower == 'icons') {
+          lower == 'icons' ||
+          lower.startsWith('rocketdock') ||
+          lower.startsWith('icon') ||
+          lower.startsWith('item')) {
         return true;
+      }
+      // Also detect by RocketDock-style keys like "0-Title", "0-Command", "IconMin"
+      for (final k in entry.value.keys) {
+        final kl = k.toLowerCase();
+        if (kl == '0-title' || kl == '0-command' || kl == '0-filename' || kl == 'iconmin') {
+          return true;
+        }
       }
     }
     return false;
   }
 
-  /// Import an original RocketDock 1.3.5 Settings.ini file into [targetDockId] (1..4).
-  /// Supports UTF-16LE, UTF-8, and Cyrillic ANSI (CP1251) encodings!
+  static bool isAeroDockIni(Map<String, Map<String, String>> sections) {
+    return sections.containsKey('Dock1') || sections.containsKey('Dock1-Items');
+  }
+
+  /// Import an original RocketDock 1.3.5 Settings.ini (ALL real formats!) OR an AeroDock Settings.ini!
+  /// Supports UTF-16LE (with/without BOM), UTF-8, and Cyrillic ANSI (CP1251).
   Future<RocketDockImportResult> importRocketDock135Ini(
     File sourceFile, {
     required int targetDockId,
@@ -636,26 +961,112 @@ class PortableIniStore {
       final text = decodeWindowsIniBytes(bytes);
       final sections = parseIniText(text);
 
-      // Find RocketDock main settings section
+      // Safety backup before importing
+      if (backupSettings.autoBackupEnabled && iniFile.existsSync()) {
+        await createBackup(tag: 'pre_import');
+      }
+
+      // ------------------------------------------------------------------
+      // CASE 1: User selected an AeroDock Settings.ini (e.g., from another folder / backup)!
+      // ------------------------------------------------------------------
+      if (isAeroDockIni(sections)) {
+        // If importing into Dock 1 with replace, import ALL docks + DevRules if user wants full profile,
+        // or import the matching Dock section into targetDockId.
+        final srcItemsSec = sections['Dock$targetDockId-Items'] ?? sections['Dock1-Items'];
+        final srcPanelSec = sections['Dock$targetDockId'] ?? sections['Dock1'];
+        final importedList = <DockItemModel>[];
+
+        if (srcItemsSec != null) {
+          final count = _int(srcItemsSec['Count'], 0);
+          for (var i = 0; i < count; i++) {
+            final prefix = 'Item$i';
+            final type = srcItemsSec['$prefix.Type'];
+            if (type == null || type.isEmpty) continue;
+            final rawIcon = _emptyToNull(srcItemsSec['$prefix.IconPath']);
+            final rawAlt = _emptyToNull(srcItemsSec['$prefix.IconPathAlt']);
+            importedList.add(
+              DockItemModel(
+                id: 'imp_${DateTime.now().millisecondsSinceEpoch}_$i',
+                type: type,
+                title: srcItemsSec['$prefix.Title'] ?? '',
+                target: srcItemsSec['$prefix.Target'] ?? '',
+                startIn: srcItemsSec['$prefix.StartIn'] ?? '',
+                args: srcItemsSec['$prefix.Args'] ?? '',
+                runMode: srcItemsSec['$prefix.RunMode'] ?? 'normal',
+                openRunning: srcItemsSec['$prefix.OpenRunning'] ?? 'global',
+                popupMenu: _bool(srcItemsSec['$prefix.PopupMenu'], true),
+                iconKey: srcItemsSec['$prefix.IconKey'] ?? 'rocket',
+                color: srcItemsSec['$prefix.Color'] ?? '#0284C7',
+                iconPath: rawIcon != null ? fromPortablePath(rawIcon) : null,
+                iconPathAlt: rawAlt != null ? fromPortablePath(rawAlt) : null,
+                devRuleId: _emptyToNull(srcItemsSec['$prefix.DevRuleId']),
+              ),
+            );
+          }
+        }
+
+        if (importVisualSettings && srcPanelSec != null) {
+          panels[targetDockId] = _parsePanelSection(targetDockId, srcPanelSec);
+        }
+        if (importedList.isNotEmpty) {
+          if (replaceExistingItems) {
+            dockItems[targetDockId] = importedList;
+          } else {
+            dockItems.putIfAbsent(targetDockId, () => []).addAll(importedList);
+          }
+        }
+        await save();
+        return RocketDockImportResult(
+          ok: true,
+          importedItems: importedList.length,
+          importedSettings: importVisualSettings && srcPanelSec != null,
+          message: 'Импортирован Settings.ini AeroDock: ${importedList.length} значков в Панель $targetDockId.',
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // CASE 2: Original RocketDock 1.3.5 (and ObjectDock/RK/Y'z Dock) Settings.ini
+      // Real RocketDock 1.3.5 stores BOTH settings AND `0-Title`/`0-Command`/`0-FileName`
+      // inside [RocketDock], OR in [RocketDock\Icons] / [Software\RocketDock\Icons] / [Icons] / [Icon0..N]!
+      // ------------------------------------------------------------------
       Map<String, String>? rdMain;
-      Map<String, String>? rdIcons;
+      final rdIconMaps = <Map<String, String>>[];
+      final perIconSections = <Map<String, String>>[];
+
       for (final entry in sections.entries) {
         final lower = entry.key.toLowerCase();
-        if (lower == 'rocketdock' || lower == r'software\rocketdock') {
-          rdMain = entry.value;
+        final map = entry.value;
+        final hasIndexedKeys = map.keys.any((k) {
+          final dash = k.indexOf('-');
+          return dash > 0 && int.tryParse(k.substring(0, dash)) != null;
+        });
+
+        if (lower == 'rocketdock' ||
+            lower == 'rocketdock-settings' ||
+            lower == r'software\rocketdock' ||
+            lower == 'settings' ||
+            lower == 'dock') {
+          rdMain ??= map;
+          if (hasIndexedKeys) rdIconMaps.add(map);
         } else if (lower == r'rocketdock\icons' ||
             lower == r'software\rocketdock\icons' ||
-            lower == 'icons') {
-          rdIcons = entry.value;
+            lower == 'rocketdock-icons' ||
+            lower == 'icons' ||
+            lower.endsWith(r'\icons')) {
+          rdIconMaps.add(map);
+        } else if (RegExp(r'^(rocketdock[-_\\]?icon|icon|item)\d+$').hasMatch(lower)) {
+          perIconSections.add(map);
+        } else if (hasIndexedKeys) {
+          rdIconMaps.add(map);
         }
       }
 
-      if (rdMain == null && rdIcons == null) {
+      if (rdMain == null && rdIconMaps.isEmpty && perIconSections.isEmpty) {
         return const RocketDockImportResult(
           ok: false,
           importedItems: 0,
           importedSettings: false,
-          message: 'Файл не похож на Settings.ini из RocketDock 1.3.5 (не найдены секции [RocketDock] / [Software\\RocketDock\\Icons]).',
+          message: 'Не удалось распознать формат INI (проверьте, что файл содержит секции [RocketDock], [Icons] или [Dock1]).',
         );
       }
 
@@ -685,7 +1096,7 @@ class PortableIniStore {
 
         final iconMin = double.tryParse(getCI('IconMin') ?? '');
         final iconMax = double.tryParse(getCI('IconMax') ?? '');
-        if (iconMin != null && iconMin >= 24 && iconMin <= 128) {
+        if (iconMin != null && iconMin >= 16 && iconMin <= 128) {
           panel.iconSize = iconMin.clamp(32, 96);
           if (iconMax != null && iconMax >= iconMin) {
             panel.zoomScale = (iconMax / iconMin).clamp(1.0, 2.2);
@@ -742,9 +1153,10 @@ class PortableIniStore {
           panel.bgOpacity = (opRaw > 100 ? (opRaw / 255.0) * 100.0 : opRaw).clamp(0, 100);
         }
 
-        final showLabels = getCI('ShowLabels') ?? getCI('DisableLabels');
-        if (getCI('DisableLabels') != null) {
-          panel.showLabels = getCI('DisableLabels') != '1';
+        final disableLabels = getCI('DisableLabels');
+        final showLabels = getCI('ShowLabels');
+        if (disableLabels != null) {
+          panel.showLabels = disableLabels != '1';
         } else if (showLabels != null) {
           panel.showLabels = showLabels == '1';
         }
@@ -757,7 +1169,6 @@ class PortableIniStore {
           panel.labelFontSize = fontSize.clamp(9, 24);
         }
 
-        // If the RocketDock skin folder exists in Skins/, link it automatically
         final themeName = getCI('Theme');
         if (themeName != null && themeName.isNotEmpty) {
           final localSkin = Directory(p.join(skinsDir.path, themeName));
@@ -770,9 +1181,106 @@ class PortableIniStore {
         settingsImported = true;
       }
 
-      // Parse RocketDock 1.3.5 Icons (0-Title, 0-Command, 0-FileName, 0-Arguments, 0-WorkingDirectory...)
+      String? resolveRdIconPath(String? raw) {
+        if (raw == null || raw.trim().isEmpty) return null;
+        final cleaned = raw.replaceAll('"', '').trim();
+        if (File(cleaned).existsSync()) return cleaned;
+        final relToSource = p.join(baseDir, cleaned);
+        if (File(relToSource).existsSync()) return relToSource;
+        final relToSourceIcons = p.join(baseDir, 'Icons', cleaned);
+        if (File(relToSourceIcons).existsSync()) return relToSourceIcons;
+        final relToIcons = p.join(iconsDir.path, p.basename(cleaned));
+        if (File(relToIcons).existsSync()) return relToIcons;
+        return null;
+      }
+
+      DockItemModel buildRdItem({
+        required int idx,
+        required bool isSep,
+        required String rdType,
+        required String title,
+        required String cmd,
+        required String args,
+        required String workDir,
+        required String? fileName,
+        required String? fileName2,
+        required String showCmd,
+        required String openRunRaw,
+        required bool useCtx,
+      }) {
+        final cmdLower = cmd.toLowerCase();
+        String type;
+        String resolvedTarget = cmd;
+        String iconKey = 'rocket';
+        String color = '#0284C7';
+
+        if (isSep || rdType == '1' || cmdLower == '[separator]') {
+          type = 'separator';
+        } else if (cmdLower == '[settings]' || cmdLower.contains('dock settings') || rdType == '3' && cmdLower.isEmpty) {
+          type = 'dock_settings';
+          iconKey = 'settings';
+          color = '#475569';
+        } else if (cmdLower == '[quit]') {
+          type = 'quit';
+          iconKey = 'power';
+          color = '#E11D48';
+        } else if (cmdLower.contains('645ff040-5081-101b-9f08-00aa002f954e') ||
+            cmdLower == '[recyclebin]' ||
+            cmdLower.contains('recyclebin')) {
+          type = 'recycle_bin';
+          resolvedTarget = 'shell:RecycleBinFolder';
+          iconKey = 'trash';
+          color = '#64748B';
+        } else if (cmdLower.contains('clock')) {
+          type = 'docklet_clock';
+          iconKey = 'clock';
+        } else if (cmdLower.startsWith('http://') || cmdLower.startsWith('https://')) {
+          type = 'blank';
+          iconKey = 'globe';
+        } else if (cmd.isNotEmpty && FileSystemEntity.isDirectorySync(cmd)) {
+          type = 'path';
+          iconKey = 'folder-blue';
+          color = '#2563EB';
+        } else if (cmd.isNotEmpty) {
+          type = 'file';
+        } else {
+          type = 'blank';
+        }
+
+        final runMode = switch (showCmd) {
+          '2' || '7' => 'minimized',
+          '3' => 'maximized',
+          _ => 'normal',
+        };
+        final openRunning = switch (openRunRaw) {
+          '1' => 'always',
+          '2' => 'never',
+          _ => 'global',
+        };
+
+        return DockItemModel(
+          id: 'rd135_${DateTime.now().millisecondsSinceEpoch}_$idx',
+          type: type,
+          title: title.isEmpty
+              ? (type == 'separator' ? 'Разделитель' : p.basenameWithoutExtension(cmd))
+              : title,
+          target: resolvedTarget,
+          startIn: workDir,
+          args: args,
+          runMode: runMode,
+          openRunning: openRunning,
+          popupMenu: useCtx,
+          iconKey: iconKey,
+          color: color,
+          iconPath: resolveRdIconPath(fileName),
+          iconPathAlt: resolveRdIconPath(fileName2),
+        );
+      }
+
       final importedList = <DockItemModel>[];
-      if (rdIcons != null) {
+
+      // Parse indexed icon keys (`0-Title`, `0-Command`, `0-FileName`, `0-Type`, ...)
+      for (final rdIcons in rdIconMaps) {
         final indices = <int>{};
         for (final key in rdIcons.keys) {
           final dash = key.indexOf('-');
@@ -785,103 +1293,59 @@ class PortableIniStore {
 
         String? iconVal(int i, String field) {
           final wanted = '$i-${field.toLowerCase()}';
-          for (final e in rdIcons!.entries) {
+          for (final e in rdIcons.entries) {
             if (e.key.toLowerCase() == wanted) return e.value;
           }
           return null;
         }
 
-        String? resolveRdIconPath(String? raw) {
-          if (raw == null || raw.trim().isEmpty) return null;
-          final cleaned = raw.replaceAll('"', '').trim();
-          if (File(cleaned).existsSync()) return cleaned;
-          final relToSource = p.join(baseDir, cleaned);
-          if (File(relToSource).existsSync()) return relToSource;
-          final relToIcons = p.join(iconsDir.path, p.basename(cleaned));
-          if (File(relToIcons).existsSync()) return relToIcons;
-          return null;
-        }
-
         for (final idx in sorted) {
-          final isSep = iconVal(idx, 'IsSeparator') == '1';
-          final title = iconVal(idx, 'Title') ?? '';
-          final cmd = iconVal(idx, 'Command') ?? iconVal(idx, 'Target') ?? '';
-          final args = iconVal(idx, 'Arguments') ?? '';
-          final workDir = iconVal(idx, 'WorkingDirectory') ?? iconVal(idx, 'StartIn') ?? '';
-          final fileName = iconVal(idx, 'FileName') ?? iconVal(idx, 'Icon') ?? iconVal(idx, 'Image');
-          final fileName2 = iconVal(idx, 'FileName2');
-          final showCmd = iconVal(idx, 'ShowCmd') ?? '1';
-          final openRunRaw = iconVal(idx, 'OpenRunning') ?? '0';
-          final useCtx = iconVal(idx, 'UseContext') != '0';
-
-          final cmdLower = cmd.toLowerCase();
-          String type;
-          String resolvedTarget = cmd;
-          String iconKey = 'rocket';
-          String color = '#0284C7';
-
-          if (isSep || cmdLower == '[separator]') {
-            type = 'separator';
-          } else if (cmdLower == '[settings]' || cmdLower.contains('dock settings')) {
-            type = 'dock_settings';
-            iconKey = 'settings';
-            color = '#475569';
-          } else if (cmdLower == '[quit]') {
-            type = 'quit';
-            iconKey = 'power';
-            color = '#E11D48';
-          } else if (cmdLower.contains('645ff040-5081-101b-9f08-00aa002f954e') ||
-              cmdLower == '[recyclebin]' ||
-              cmdLower.contains('recyclebin')) {
-            type = 'recycle_bin';
-            resolvedTarget = 'shell:RecycleBinFolder';
-            iconKey = 'trash';
-            color = '#64748B';
-          } else if (cmdLower.contains('clock')) {
-            type = 'docklet_clock';
-            iconKey = 'clock';
-          } else if (cmdLower.startsWith('http://') || cmdLower.startsWith('https://')) {
-            type = 'blank';
-            iconKey = 'globe';
-          } else if (cmd.isNotEmpty && FileSystemEntity.isDirectorySync(cmd)) {
-            type = 'path';
-            iconKey = 'folder-blue';
-            color = '#2563EB';
-          } else if (cmd.isNotEmpty) {
-            type = 'file';
-          } else {
-            type = 'blank';
-          }
-
-          final runMode = switch (showCmd) {
-            '2' || '7' => 'minimized',
-            '3' => 'maximized',
-            _ => 'normal',
-          };
-          final openRunning = switch (openRunRaw) {
-            '1' => 'always',
-            '2' => 'never',
-            _ => 'global',
-          };
-
           importedList.add(
-            DockItemModel(
-              id: 'rd135_${DateTime.now().millisecondsSinceEpoch}_$idx',
-              type: type,
-              title: title.isEmpty ? (type == 'separator' ? 'Разделитель' : p.basenameWithoutExtension(cmd)) : title,
-              target: resolvedTarget,
-              startIn: workDir,
-              args: args,
-              runMode: runMode,
-              openRunning: openRunning,
-              popupMenu: useCtx,
-              iconKey: iconKey,
-              color: color,
-              iconPath: resolveRdIconPath(fileName),
-              iconPathAlt: resolveRdIconPath(fileName2),
+            buildRdItem(
+              idx: idx,
+              isSep: iconVal(idx, 'IsSeparator') == '1',
+              rdType: iconVal(idx, 'Type') ?? '0',
+              title: iconVal(idx, 'Title') ?? '',
+              cmd: iconVal(idx, 'Command') ?? iconVal(idx, 'Target') ?? '',
+              args: iconVal(idx, 'Arguments') ?? '',
+              workDir: iconVal(idx, 'WorkingDirectory') ?? iconVal(idx, 'StartIn') ?? '',
+              fileName: iconVal(idx, 'FileName') ?? iconVal(idx, 'Icon') ?? iconVal(idx, 'Image'),
+              fileName2: iconVal(idx, 'FileName2'),
+              showCmd: iconVal(idx, 'ShowCmd') ?? '1',
+              openRunRaw: iconVal(idx, 'OpenRunning') ?? '0',
+              useCtx: iconVal(idx, 'UseContext') != '0',
             ),
           );
         }
+      }
+
+      // Also parse per-icon sections (`[Icon0]`, `[Item0]`, etc.) if present
+      for (var i = 0; i < perIconSections.length; i++) {
+        final sec = perIconSections[i];
+        String? val(String field) {
+          final fl = field.toLowerCase();
+          for (final e in sec.entries) {
+            if (e.key.toLowerCase() == fl) return e.value;
+          }
+          return null;
+        }
+
+        importedList.add(
+          buildRdItem(
+            idx: 1000 + i,
+            isSep: val('IsSeparator') == '1',
+            rdType: val('Type') ?? '0',
+            title: val('Title') ?? val('Name') ?? '',
+            cmd: val('Command') ?? val('Target') ?? val('Link') ?? '',
+            args: val('Arguments') ?? val('Args') ?? '',
+            workDir: val('WorkingDirectory') ?? val('StartIn') ?? '',
+            fileName: val('FileName') ?? val('Icon') ?? val('Image'),
+            fileName2: val('FileName2'),
+            showCmd: val('ShowCmd') ?? '1',
+            openRunRaw: val('OpenRunning') ?? '0',
+            useCtx: val('UseContext') != '0',
+          ),
+        );
       }
 
       if (importedList.isNotEmpty) {
@@ -909,6 +1373,46 @@ class PortableIniStore {
     }
   }
 
+  DockPanelConfig _parsePanelSection(int id, Map<String, String> s) {
+    final def = DockPanelConfig.defaultFor(id);
+    return DockPanelConfig(
+      dockId: id,
+      name: s['Name'] ?? def.name,
+      position: s['Position'] ?? def.position,
+      monitorIndex: _int(s['Monitor'], def.monitorIndex),
+      layer: s['Layer'] ?? def.layer,
+      centerOffset: _double(s['CenterOffset'], def.centerOffset).clamp(-40, 40),
+      edgeOffset: _double(s['EdgeOffset'], def.edgeOffset).clamp(0, 64),
+      renderQuality: s['RenderQuality'] ?? def.renderQuality,
+      iconOpacity: _double(s['IconOpacity'], def.iconOpacity).clamp(20, 100),
+      zoomOpaque: _bool(s['ZoomOpaque'], def.zoomOpaque),
+      iconSize: _double(s['IconSize'], def.iconSize).clamp(32, 96),
+      hoverEffect: s['HoverEffect'] ?? def.hoverEffect,
+      zoomScale: _double(s['ZoomScale'], def.zoomScale).clamp(1.0, 2.2),
+      zoomWidth: _double(s['ZoomWidth'], def.zoomWidth).clamp(1.0, 6.0),
+      zoomDurationMs: _int(s['ZoomDurationMs'], def.zoomDurationMs).clamp(60, 400),
+      theme: s['Theme'] ?? def.theme,
+      bgOpacity: _double(s['BgOpacity'], def.bgOpacity).clamp(0, 100),
+      useAcrylic: _bool(s['UseAcrylic'], def.useAcrylic),
+      showLabels: _bool(s['ShowLabels'], def.showLabels),
+      labelFontFamily: s['LabelFontFamily'] ?? def.labelFontFamily,
+      labelFontSize: _double(s['LabelFontSize'], def.labelFontSize).clamp(9, 24),
+      labelBold: _bool(s['LabelBold'], def.labelBold),
+      labelItalic: _bool(s['LabelItalic'], def.labelItalic),
+      labelColor: s['LabelColor'] ?? def.labelColor,
+      labelShadowColor: s['LabelShadowColor'] ?? def.labelShadowColor,
+      labelShadowOpacity: _double(s['LabelShadowOpacity'], def.labelShadowOpacity).clamp(0, 100),
+      labelOutlineColor: s['LabelOutlineColor'] ?? def.labelOutlineColor,
+      labelOutlineOpacity: _double(s['LabelOutlineOpacity'], def.labelOutlineOpacity).clamp(0, 100),
+      clickEffect: s['ClickEffect'] ?? def.clickEffect,
+      autoHide: _bool(s['AutoHide'], def.autoHide),
+      autoHideDurationMs: _int(s['AutoHideDurationMs'], def.autoHideDurationMs).clamp(60, 1000),
+      autoHideDelayMs: _int(s['AutoHideDelayMs'], def.autoHideDelayMs).clamp(0, 2000),
+      popupOnMouseover: _bool(s['PopupOnMouseover'], def.popupOnMouseover),
+      popupDelayMs: _int(s['PopupDelayMs'], def.popupDelayMs).clamp(0, 2000),
+    );
+  }
+
   Future<void> reloadFromDisk() async {
     if (!await iniFile.exists()) return;
     final bytes = await iniFile.readAsBytes();
@@ -916,7 +1420,7 @@ class PortableIniStore {
     final sections = parseIniText(text);
 
     // If the user literally replaced Settings.ini with a RocketDock 1.3.5 Settings.ini!
-    if (isRocketDock135Ini(sections) && !sections.containsKey('Dock1')) {
+    if (isRocketDock135Ini(sections) && !isAeroDockIni(sections)) {
       await importRocketDock135Ini(iniFile, targetDockId: 1);
       return;
     }
@@ -940,7 +1444,21 @@ class PortableIniStore {
           : legacyDockCount >= 3,
       devDockEnabled: _bool(g['DevDockEnabled'], true),
       excludedWindows: _list(g['ExcludedWindows']),
-      iconFolders: _list(g['IconFolders']),
+      iconFolders: _list(g['IconFolders']).map(fromPortablePath).toList(),
+    );
+
+    // Load Backup & Upgrade Profile Sync settings
+    final bSec = sections['Backup'] ?? {};
+    final bDef = BackupSettings.defaults();
+    backupSettings = BackupSettings(
+      autoBackupEnabled: _bool(bSec['AutoBackupEnabled'], bDef.autoBackupEnabled),
+      autoBackupIntervalHours: _int(bSec['AutoBackupIntervalHours'], bDef.autoBackupIntervalHours).clamp(0, 720),
+      maxAutoBackups: _int(bSec['MaxAutoBackups'], bDef.maxAutoBackups).clamp(2, 50),
+      backupFolder: (bSec['BackupFolder'] ?? '').isNotEmpty
+          ? fromPortablePath(bSec['BackupFolder']!)
+          : bDef.backupFolder,
+      autoSyncProfile: _bool(bSec['AutoSyncProfile'], bDef.autoSyncProfile),
+      lastBackupIso: bSec['LastBackupIso'] ?? '',
     );
 
     // Load DevDock settings & rules
@@ -971,10 +1489,10 @@ class PortableIniStore {
 
     devSettings = DevDockSettings(
       watchFolder: (devSec['WatchFolder'] ?? '').isNotEmpty
-          ? devSec['WatchFolder']!
+          ? fromPortablePath(devSec['WatchFolder']!)
           : devDef.watchFolder,
       appsRootFolder: (devSec['AppsRootFolder'] ?? '').isNotEmpty
-          ? devSec['AppsRootFolder']!
+          ? fromPortablePath(devSec['AppsRootFolder']!)
           : devDef.appsRootFolder,
       maxBackupsPerApp: _int(devSec['MaxBackupsPerApp'], 5).clamp(1, 30),
       defaultPreserveExts: (devSec['DefaultPreserveExts'] ?? '').isNotEmpty
@@ -987,44 +1505,8 @@ class PortableIniStore {
 
     for (var id = 1; id <= 4; id++) {
       final s = sections['Dock$id'];
-      final def = DockPanelConfig.defaultFor(id);
       if (s != null) {
-        panels[id] = DockPanelConfig(
-          dockId: id,
-          name: s['Name'] ?? def.name,
-          position: s['Position'] ?? def.position,
-          monitorIndex: _int(s['Monitor'], def.monitorIndex),
-          layer: s['Layer'] ?? def.layer,
-          centerOffset: _double(s['CenterOffset'], def.centerOffset).clamp(-40, 40),
-          edgeOffset: _double(s['EdgeOffset'], def.edgeOffset).clamp(0, 64),
-          renderQuality: s['RenderQuality'] ?? def.renderQuality,
-          iconOpacity: _double(s['IconOpacity'], def.iconOpacity).clamp(20, 100),
-          zoomOpaque: _bool(s['ZoomOpaque'], def.zoomOpaque),
-          iconSize: _double(s['IconSize'], def.iconSize).clamp(32, 96),
-          hoverEffect: s['HoverEffect'] ?? def.hoverEffect,
-          zoomScale: _double(s['ZoomScale'], def.zoomScale).clamp(1.0, 2.2),
-          zoomWidth: _double(s['ZoomWidth'], def.zoomWidth).clamp(1.0, 6.0),
-          zoomDurationMs: _int(s['ZoomDurationMs'], def.zoomDurationMs).clamp(60, 400),
-          theme: s['Theme'] ?? def.theme,
-          bgOpacity: _double(s['BgOpacity'], def.bgOpacity).clamp(0, 100),
-          useAcrylic: _bool(s['UseAcrylic'], def.useAcrylic),
-          showLabels: _bool(s['ShowLabels'], def.showLabels),
-          labelFontFamily: s['LabelFontFamily'] ?? def.labelFontFamily,
-          labelFontSize: _double(s['LabelFontSize'], def.labelFontSize).clamp(9, 24),
-          labelBold: _bool(s['LabelBold'], def.labelBold),
-          labelItalic: _bool(s['LabelItalic'], def.labelItalic),
-          labelColor: s['LabelColor'] ?? def.labelColor,
-          labelShadowColor: s['LabelShadowColor'] ?? def.labelShadowColor,
-          labelShadowOpacity: _double(s['LabelShadowOpacity'], def.labelShadowOpacity).clamp(0, 100),
-          labelOutlineColor: s['LabelOutlineColor'] ?? def.labelOutlineColor,
-          labelOutlineOpacity: _double(s['LabelOutlineOpacity'], def.labelOutlineOpacity).clamp(0, 100),
-          clickEffect: s['ClickEffect'] ?? def.clickEffect,
-          autoHide: _bool(s['AutoHide'], def.autoHide),
-          autoHideDurationMs: _int(s['AutoHideDurationMs'], def.autoHideDurationMs).clamp(60, 1000),
-          autoHideDelayMs: _int(s['AutoHideDelayMs'], def.autoHideDelayMs).clamp(0, 2000),
-          popupOnMouseover: _bool(s['PopupOnMouseover'], def.popupOnMouseover),
-          popupDelayMs: _int(s['PopupDelayMs'], def.popupDelayMs).clamp(0, 2000),
-        );
+        panels[id] = _parsePanelSection(id, s);
       }
 
       final itemsSec = sections['Dock$id-Items'];
@@ -1035,21 +1517,23 @@ class PortableIniStore {
           final prefix = 'Item$i';
           final type = itemsSec['$prefix.Type'];
           if (type == null || type.isEmpty) continue;
+          final rawIcon = _emptyToNull(itemsSec['$prefix.IconPath']);
+          final rawAlt = _emptyToNull(itemsSec['$prefix.IconPathAlt']);
           list.add(
             DockItemModel(
               id: itemsSec['$prefix.Id'] ?? 'd${id}_$i',
               type: type,
               title: itemsSec['$prefix.Title'] ?? '',
-              target: itemsSec['$prefix.Target'] ?? '',
-              startIn: itemsSec['$prefix.StartIn'] ?? '',
+              target: fromPortablePath(itemsSec['$prefix.Target'] ?? ''),
+              startIn: fromPortablePath(itemsSec['$prefix.StartIn'] ?? ''),
               args: itemsSec['$prefix.Args'] ?? '',
               runMode: itemsSec['$prefix.RunMode'] ?? 'normal',
               openRunning: itemsSec['$prefix.OpenRunning'] ?? 'global',
               popupMenu: _bool(itemsSec['$prefix.PopupMenu'], true),
               iconKey: itemsSec['$prefix.IconKey'] ?? 'rocket',
               color: itemsSec['$prefix.Color'] ?? '#0284C7',
-              iconPath: _emptyToNull(itemsSec['$prefix.IconPath']),
-              iconPathAlt: _emptyToNull(itemsSec['$prefix.IconPathAlt']),
+              iconPath: rawIcon != null ? fromPortablePath(rawIcon) : null,
+              iconPathAlt: rawAlt != null ? fromPortablePath(rawAlt) : null,
               devRuleId: _emptyToNull(itemsSec['$prefix.DevRuleId']),
             ),
           );
@@ -1061,9 +1545,9 @@ class PortableIniStore {
     lastLoadedModified = await iniFile.lastModified();
   }
 
-  Future<void> save() async {
+  Future<void> save({bool skipProfileSync = false}) async {
     final sb = StringBuffer()
-      ..writeln('; AeroDock Portable v3.5 — Settings.ini (UTF-8, RocketDock 1.3.5 Import + Dev Panel)')
+      ..writeln('; AeroDock Portable v3.6 — Settings.ini (UTF-8, RocketDock 1.3.5 Import + Live Preview + Auto-Backup)')
       ..writeln('[General]')
       ..writeln('Language=${global.language}')
       ..writeln('LaunchWithWindows=${global.launchWithWindows ? 1 : 0}')
@@ -1077,11 +1561,19 @@ class PortableIniStore {
       ..writeln('Dock3Enabled=${global.dock3Enabled ? 1 : 0}')
       ..writeln('DevDockEnabled=${global.devDockEnabled ? 1 : 0}')
       ..writeln('ExcludedWindows=${global.excludedWindows.join('|')}')
-      ..writeln('IconFolders=${global.iconFolders.join('|')}')
+      ..writeln('IconFolders=${global.iconFolders.map(toPortablePath).join('|')}')
+      ..writeln('')
+      ..writeln('[Backup]')
+      ..writeln('AutoBackupEnabled=${backupSettings.autoBackupEnabled ? 1 : 0}')
+      ..writeln('AutoBackupIntervalHours=${backupSettings.autoBackupIntervalHours}')
+      ..writeln('MaxAutoBackups=${backupSettings.maxAutoBackups}')
+      ..writeln('BackupFolder=${_sanitizeIniVal(toPortablePath(backupSettings.backupFolder))}')
+      ..writeln('AutoSyncProfile=${backupSettings.autoSyncProfile ? 1 : 0}')
+      ..writeln('LastBackupIso=${_sanitizeIniVal(backupSettings.lastBackupIso)}')
       ..writeln('')
       ..writeln('[DevDock]')
-      ..writeln('WatchFolder=${_sanitizeIniVal(devSettings.watchFolder)}')
-      ..writeln('AppsRootFolder=${_sanitizeIniVal(devSettings.appsRootFolder)}')
+      ..writeln('WatchFolder=${_sanitizeIniVal(toPortablePath(devSettings.watchFolder))}')
+      ..writeln('AppsRootFolder=${_sanitizeIniVal(toPortablePath(devSettings.appsRootFolder))}')
       ..writeln('MaxBackupsPerApp=${devSettings.maxBackupsPerApp}')
       ..writeln('DefaultPreserveExts=${_sanitizeIniVal(devSettings.defaultPreserveExts)}')
       ..writeln('MoveArchiveToStorage=${devSettings.moveArchiveToStorage ? 1 : 0}')
@@ -1157,16 +1649,16 @@ class PortableIniStore {
           ..writeln('$pre.Id=${it.id}')
           ..writeln('$pre.Type=${it.type}')
           ..writeln('$pre.Title=${_sanitizeIniVal(it.title)}')
-          ..writeln('$pre.Target=${_sanitizeIniVal(it.target)}')
-          ..writeln('$pre.StartIn=${_sanitizeIniVal(it.startIn)}')
+          ..writeln('$pre.Target=${_sanitizeIniVal(toPortablePath(it.target))}')
+          ..writeln('$pre.StartIn=${_sanitizeIniVal(toPortablePath(it.startIn))}')
           ..writeln('$pre.Args=${_sanitizeIniVal(it.args)}')
           ..writeln('$pre.RunMode=${it.runMode}')
           ..writeln('$pre.OpenRunning=${it.openRunning}')
           ..writeln('$pre.PopupMenu=${it.popupMenu ? 1 : 0}')
           ..writeln('$pre.IconKey=${it.iconKey}')
           ..writeln('$pre.Color=${it.color}')
-          ..writeln('$pre.IconPath=${_sanitizeIniVal(it.iconPath ?? '')}')
-          ..writeln('$pre.IconPathAlt=${_sanitizeIniVal(it.iconPathAlt ?? '')}')
+          ..writeln('$pre.IconPath=${_sanitizeIniVal(toPortablePath(it.iconPath ?? ''))}')
+          ..writeln('$pre.IconPathAlt=${_sanitizeIniVal(toPortablePath(it.iconPathAlt ?? ''))}')
           ..writeln('$pre.DevRuleId=${_sanitizeIniVal(it.devRuleId ?? '')}');
       }
       sb.writeln('');
@@ -1174,9 +1666,15 @@ class PortableIniStore {
 
     await iniFile.writeAsString(sb.toString(), flush: true);
     lastLoadedModified = await iniFile.lastModified();
+    if (!skipProfileSync) {
+      await _syncToUserProfile();
+    }
   }
 
   Future<void> resetSettingsToDefaultsOnly() async {
+    if (backupSettings.autoBackupEnabled && iniFile.existsSync()) {
+      await createBackup(tag: 'pre_reset');
+    }
     final keepD2 = global.dock2Enabled;
     final keepD3 = global.dock3Enabled;
     final keepDev = global.devDockEnabled;
@@ -1191,6 +1689,9 @@ class PortableIniStore {
   }
 
   Future<void> fullReset() async {
+    if (backupSettings.autoBackupEnabled && iniFile.existsSync()) {
+      await createBackup(tag: 'pre_full_reset');
+    }
     if (await iniFile.exists()) {
       await iniFile.delete();
     }
