@@ -96,6 +96,29 @@ final class _Rect extends Struct {
   external int bottom;
 }
 
+final class _MonitorInfo extends Struct {
+  @Uint32()
+  external int cbSize;
+  @Int32()
+  external int monitorLeft;
+  @Int32()
+  external int monitorTop;
+  @Int32()
+  external int monitorRight;
+  @Int32()
+  external int monitorBottom;
+  @Int32()
+  external int workLeft;
+  @Int32()
+  external int workTop;
+  @Int32()
+  external int workRight;
+  @Int32()
+  external int workBottom;
+  @Uint32()
+  external int dwFlags;
+}
+
 final class _SystemPowerStatus extends Struct {
   @Uint8()
   external int acLineStatus;
@@ -334,6 +357,25 @@ class VirtualScreenRect {
     required this.width,
     required this.height,
   });
+
+  double get right => left + width;
+  double get bottom => top + height;
+}
+
+class PhysicalMonitorInfo {
+  final int hMonitor;
+  final bool isPrimary;
+  final VirtualScreenRect monitorRect;
+  final VirtualScreenRect workRect;
+  final double scaleFactor;
+
+  const PhysicalMonitorInfo({
+    required this.hMonitor,
+    required this.isPrimary,
+    required this.monitorRect,
+    required this.workRect,
+    required this.scaleFactor,
+  });
 }
 
 class FolderEntryInfo {
@@ -415,6 +457,33 @@ typedef _SetWindowPosDart = int Function(
 
 typedef _GetWindowRectNative = Int32 Function(IntPtr hwnd, Pointer<_Rect> lpRect);
 typedef _GetWindowRectDart = int Function(int hwnd, Pointer<_Rect> lpRect);
+
+typedef _MonitorEnumProcNative = Int32 Function(
+    IntPtr hMonitor, IntPtr hdcMonitor, Pointer<_Rect> lprcMonitor, IntPtr dwData);
+
+typedef _EnumDisplayMonitorsNative = Int32 Function(
+    IntPtr hdc,
+    Pointer<_Rect> lprcClip,
+    Pointer<NativeFunction<_MonitorEnumProcNative>> lpfnEnum,
+    IntPtr dwData);
+typedef _EnumDisplayMonitorsDart = int Function(
+    int hdc,
+    Pointer<_Rect> lprcClip,
+    Pointer<NativeFunction<_MonitorEnumProcNative>> lpfnEnum,
+    int dwData);
+
+typedef _GetMonitorInfoWNative = Int32 Function(
+    IntPtr hMonitor, Pointer<_MonitorInfo> lpmi);
+typedef _GetMonitorInfoWDart = int Function(
+    int hMonitor, Pointer<_MonitorInfo> lpmi);
+
+typedef _GetDpiForWindowNative = Uint32 Function(IntPtr hwnd);
+typedef _GetDpiForWindowDart = int Function(int hwnd);
+
+typedef _GetDpiForMonitorNative = Int32 Function(
+    IntPtr hMonitor, Int32 dpiType, Pointer<Uint32> dpiX, Pointer<Uint32> dpiY);
+typedef _GetDpiForMonitorDart = int Function(
+    int hMonitor, int dpiType, Pointer<Uint32> dpiX, Pointer<Uint32> dpiY);
 
 typedef _GetCursorPosNative = Int32 Function(Pointer<_Point> lpPoint);
 typedef _GetCursorPosDart = int Function(Pointer<_Point> lpPoint);
@@ -611,6 +680,14 @@ class Win32Bridge {
       _user32.lookupFunction<_PostMessageWNative, _PostMessageWDart>('PostMessageW');
   static final _setWindowPos =
       _user32.lookupFunction<_SetWindowPosNative, _SetWindowPosDart>('SetWindowPos');
+  static final _getWindowRect =
+      _user32.lookupFunction<_GetWindowRectNative, _GetWindowRectDart>('GetWindowRect');
+  static final _enumDisplayMonitors = _user32.lookupFunction<
+      _EnumDisplayMonitorsNative, _EnumDisplayMonitorsDart>('EnumDisplayMonitors');
+  static final _getMonitorInfoW =
+      _user32.lookupFunction<_GetMonitorInfoWNative, _GetMonitorInfoWDart>('GetMonitorInfoW');
+  static final _getDpiForWindow = _tryLookupUser32Dpi();
+  static final _getDpiForMonitor = _tryLookupShcoreDpi();
   static final _getCursorPos =
       _user32.lookupFunction<_GetCursorPosNative, _GetCursorPosDart>('GetCursorPos');
   static final _getSystemMetrics = _user32
@@ -684,7 +761,7 @@ class Win32Bridge {
   static int _lastKernel = 0;
   static int _lastUser = 0;
 
-  // Callback state for synchronous EnumWindows
+  // Callback state for synchronous EnumWindows / EnumDisplayMonitors
   static final List<int> _enumBuffer = <int>[];
   static final Pointer<NativeFunction<_EnumWindowsProcNative>> _enumProcPtr =
       Pointer.fromFunction<_EnumWindowsProcNative>(_enumCallback, 0);
@@ -692,6 +769,35 @@ class Win32Bridge {
   static int _enumCallback(int hwnd, int lParam) {
     _enumBuffer.add(hwnd);
     return 1;
+  }
+
+  static final List<int> _monitorBuffer = <int>[];
+  static final Pointer<NativeFunction<_MonitorEnumProcNative>> _monitorProcPtr =
+      Pointer.fromFunction<_MonitorEnumProcNative>(_monitorEnumCallback, 0);
+
+  static int _monitorEnumCallback(
+      int hMonitor, int hdcMonitor, Pointer<_Rect> lprcMonitor, int dwData) {
+    _monitorBuffer.add(hMonitor);
+    return 1;
+  }
+
+  static _GetDpiForWindowDart? _tryLookupUser32Dpi() {
+    try {
+      return _user32.lookupFunction<_GetDpiForWindowNative, _GetDpiForWindowDart>(
+          'GetDpiForWindow');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static _GetDpiForMonitorDart? _tryLookupShcoreDpi() {
+    try {
+      final shcore = DynamicLibrary.open('shcore.dll');
+      return shcore.lookupFunction<_GetDpiForMonitorNative, _GetDpiForMonitorDart>(
+          'GetDpiForMonitor');
+    } catch (_) {
+      return null;
+    }
   }
 
   static const Set<String> _ignoredWindowClasses = {
@@ -832,23 +938,167 @@ class Win32Bridge {
     _postMessageW(hwnd, 0x0010, 0, 0); // WM_CLOSE
   }
 
+  /// Reliably locate our own Flutter top-level HWND (even while hidden before ShowWindow).
   static int findOwnWindowHandle() {
     if (!Platform.isWindows) return 0;
     _enumBuffer.clear();
     _enumWindows(_enumProcPtr, 0);
     final selfPid = currentPid;
     final pidPtr = calloc<Uint32>();
+    final classBuf = calloc<Uint16>(96);
+    var fallbackVisible = 0;
+    var fallbackAny = 0;
     try {
       for (final hwnd in _enumBuffer) {
         _getWindowThreadProcessId(hwnd, pidPtr);
-        if (pidPtr.value == selfPid && _isWindowVisible(hwnd) != 0) {
+        if (pidPtr.value != selfPid) continue;
+        _getClassNameW(hwnd, classBuf.cast<Utf16>(), 96);
+        final cls = classBuf.cast<Utf16>().toDartString();
+        if (cls == 'FLUTTER_RUNNER_WIN32_WINDOW') {
           return hwnd;
+        }
+        if (fallbackAny == 0) fallbackAny = hwnd;
+        if (fallbackVisible == 0 && _isWindowVisible(hwnd) != 0) {
+          fallbackVisible = hwnd;
         }
       }
     } finally {
       calloc.free(pidPtr);
+      calloc.free(classBuf);
     }
-    return 0;
+    return fallbackVisible != 0 ? fallbackVisible : fallbackAny;
+  }
+
+  static bool isWindowVisible(int hwnd) =>
+      Platform.isWindows && hwnd != 0 && _isWindowVisible(hwnd) != 0;
+
+  static void ensureWindowVisible(int hwnd, {bool activate = false}) {
+    if (!Platform.isWindows || hwnd == 0) return;
+    // SW_SHOW = 5, SW_SHOWNOACTIVATE = 4
+    _showWindow(hwnd, activate ? 5 : 4);
+  }
+
+  static VirtualScreenRect? getWindowRect(int hwnd) {
+    if (!Platform.isWindows || hwnd == 0) return null;
+    final rect = calloc<_Rect>();
+    try {
+      if (_getWindowRect(hwnd, rect) != 0) {
+        final w = (rect.ref.right - rect.ref.left).toDouble();
+        final h = (rect.ref.bottom - rect.ref.top).toDouble();
+        return VirtualScreenRect(
+          left: rect.ref.left.toDouble(),
+          top: rect.ref.top.toDouble(),
+          width: w,
+          height: h,
+        );
+      }
+      return null;
+    } finally {
+      calloc.free(rect);
+    }
+  }
+
+  static double getWindowScaleFactor(int hwnd, {double fallback = 1.0}) {
+    if (!Platform.isWindows || hwnd == 0) return fallback;
+    final fn = _getDpiForWindow;
+    if (fn != null) {
+      final dpi = fn(hwnd);
+      if (dpi >= 72 && dpi <= 480) {
+        return (dpi / 96.0).clamp(0.75, 4.0);
+      }
+    }
+    return fallback;
+  }
+
+  /// Enumerate all connected monitors in GUARANTEED physical pixels (primary always at index 0).
+  static List<PhysicalMonitorInfo> enumerateMonitors() {
+    final result = <PhysicalMonitorInfo>[];
+    if (!Platform.isWindows) return result;
+
+    _monitorBuffer.clear();
+    _enumDisplayMonitors(0, nullptr, _monitorProcPtr, 0);
+
+    final mi = calloc<_MonitorInfo>();
+    final dpiX = calloc<Uint32>();
+    final dpiY = calloc<Uint32>();
+    try {
+      for (final hMon in _monitorBuffer) {
+        mi.ref.cbSize = sizeOf<_MonitorInfo>();
+        if (_getMonitorInfoW(hMon, mi) == 0) continue;
+
+        var scale = 1.0;
+        final dpiFn = _getDpiForMonitor;
+        if (dpiFn != null) {
+          dpiX.value = 96;
+          dpiY.value = 96;
+          // MDT_EFFECTIVE_DPI = 0
+          if (dpiFn(hMon, 0, dpiX, dpiY) == 0 && dpiX.value >= 72 && dpiX.value <= 480) {
+            scale = (dpiX.value / 96.0).clamp(0.75, 4.0);
+          }
+        }
+
+        final mW = (mi.ref.monitorRight - mi.ref.monitorLeft).toDouble();
+        final mH = (mi.ref.monitorBottom - mi.ref.monitorTop).toDouble();
+        final wW = (mi.ref.workRight - mi.ref.workLeft).toDouble();
+        final wH = (mi.ref.workBottom - mi.ref.workTop).toDouble();
+        if (mW <= 0 || mH <= 0) continue;
+
+        result.add(
+          PhysicalMonitorInfo(
+            hMonitor: hMon,
+            isPrimary: (mi.ref.dwFlags & 1) != 0,
+            monitorRect: VirtualScreenRect(
+              left: mi.ref.monitorLeft.toDouble(),
+              top: mi.ref.monitorTop.toDouble(),
+              width: mW,
+              height: mH,
+            ),
+            workRect: VirtualScreenRect(
+              left: mi.ref.workLeft.toDouble(),
+              top: mi.ref.workTop.toDouble(),
+              width: wW > 0 ? wW : mW,
+              height: wH > 0 ? wH : mH,
+            ),
+            scaleFactor: scale,
+          ),
+        );
+      }
+    } finally {
+      calloc.free(mi);
+      calloc.free(dpiX);
+      calloc.free(dpiY);
+    }
+
+    // Keep primary monitor at index 0 so Monitor=0 is always the main display
+    result.sort((a, b) => (b.isPrimary ? 1 : 0).compareTo(a.isPrimary ? 1 : 0));
+    return result;
+  }
+
+  /// Move, resize, and Z-order the HWND directly in physical Windows screen coordinates.
+  static void setWindowBoundsPhysical(
+    int hwnd, {
+    required int left,
+    required int top,
+    required int width,
+    required int height,
+    required String layer,
+    bool show = true,
+  }) {
+    if (!Platform.isWindows || hwnd == 0) return;
+    final baseFlags = 0x0010 | (show ? 0x0040 : 0); // SWP_NOACTIVATE | SWP_SHOWWINDOW
+    switch (layer) {
+      case 'top':
+        _setWindowPos(hwnd, -1, left, top, width, height, baseFlags);
+        break;
+      case 'bottom':
+        _setWindowPos(hwnd, -2, left, top, width, height, baseFlags);
+        _setWindowPos(hwnd, 1, left, top, width, height, baseFlags);
+        break;
+      case 'normal':
+      default:
+        _setWindowPos(hwnd, -2, left, top, width, height, baseFlags);
+        break;
+    }
   }
 
   static void setWindowLayer(int hwnd, String layer) {

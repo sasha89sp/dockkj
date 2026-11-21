@@ -665,7 +665,9 @@ class PortableIniStore {
     final dockletsDir = Directory(p.join(dir.path, 'Docklets'));
 
     for (final d in [skinsDir, iconsDir, iconsCacheDir, languagesDir, dockletsDir]) {
-      if (!d.existsSync()) d.createSync(recursive: true);
+      try {
+        if (!d.existsSync()) d.createSync(recursive: true);
+      } catch (_) {}
     }
 
     final store = PortableIniStore(
@@ -693,14 +695,18 @@ class PortableIniStore {
       },
     );
 
-    if (await iniFile.exists()) {
-      await store.reloadFromDisk();
-    } else if (allowAutoMigrate && await store._tryRestoreFromProfileSync()) {
-      store.migratedFromPreviousVersion = true;
-      await store.reloadFromDisk();
-      await store.save();
-    } else {
-      await store.save();
+    try {
+      if (await iniFile.exists()) {
+        await store.reloadFromDisk();
+      } else if (allowAutoMigrate && await store._tryRestoreFromProfileSync()) {
+        store.migratedFromPreviousVersion = true;
+        await store.reloadFromDisk();
+        await store.save();
+      } else {
+        await store.save();
+      }
+    } catch (_) {
+      // Never block window creation if Settings.ini is temporarily locked or folder is read-only
     }
     return store;
   }
@@ -1415,7 +1421,18 @@ class PortableIniStore {
 
   Future<void> reloadFromDisk() async {
     if (!await iniFile.exists()) return;
-    final bytes = await iniFile.readAsBytes();
+    List<int>? bytes;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      try {
+        bytes = await iniFile.readAsBytes();
+        break;
+      } catch (_) {
+        if (attempt < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 45));
+        }
+      }
+    }
+    if (bytes == null || bytes.isEmpty) return;
     final text = decodeWindowsIniBytes(bytes);
     final sections = parseIniText(text);
 
@@ -1664,8 +1681,18 @@ class PortableIniStore {
       sb.writeln('');
     }
 
-    await iniFile.writeAsString(sb.toString(), flush: true);
-    lastLoadedModified = await iniFile.lastModified();
+    final content = sb.toString();
+    for (var attempt = 0; attempt < 4; attempt++) {
+      try {
+        await iniFile.writeAsString(content, flush: true);
+        lastLoadedModified = await iniFile.lastModified();
+        break;
+      } catch (_) {
+        if (attempt < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    }
     if (!skipProfileSync) {
       await _syncToUserProfile();
     }

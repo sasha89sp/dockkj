@@ -25,10 +25,48 @@ extension _SafeIterable<T> on Iterable<T> {
   T? get firstOrNull => isEmpty ? null : first;
 }
 
+void _logRuntimeError(Object error, StackTrace? stack) {
+  try {
+    final dir = PortableIniStore.resolvePortableDir();
+    final logFile = File(p.join(dir.path, 'aerodock_error.log'));
+    final ts = DateTime.now().toIso8601String();
+    logFile.writeAsStringSync(
+      '[$ts] $error\n${stack ?? ''}\n\n',
+      mode: FileMode.append,
+      flush: true,
+    );
+  } catch (_) {}
+}
+
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
-  await windowManager.ensureInitialized();
-  await acrylic.Window.initialize();
+  FlutterError.onError = (details) {
+    _logRuntimeError(details.exception, details.stack);
+  };
+  WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+    _logRuntimeError(error, stack);
+    return true;
+  };
+
+  try {
+    await _bootstrapAeroDock(args);
+  } catch (e, st) {
+    _logRuntimeError(e, st);
+  }
+}
+
+Future<void> _bootstrapAeroDock(List<String> args) async {
+  try {
+    await windowManager.ensureInitialized();
+  } catch (e, st) {
+    _logRuntimeError(e, st);
+  }
+
+  try {
+    await acrylic.Window.initialize();
+  } catch (e, st) {
+    _logRuntimeError(e, st);
+  }
 
   var dockId = 1;
   var isSettingsWindow = false;
@@ -49,7 +87,9 @@ Future<void> main(List<String> args) async {
     final store = await PortableIniStore.load(allowAutoMigrate: false);
     AppI18n.loadExternalLanguages(store.languagesDir);
     AppI18n.currentCode = store.global.language;
-    store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
+    try {
+      store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
+    } catch (_) {}
 
     var displays = <Display>[];
     try {
@@ -65,20 +105,6 @@ Future<void> main(List<String> args) async {
       alwaysOnTop: true,
     );
 
-    await windowManager.waitUntilReadyToShow(settingsOpts, () async {
-      await windowManager.setAsFrameless();
-      await windowManager.setHasShadow(false);
-      await windowManager.setBackgroundColor(Colors.transparent);
-      await windowManager.setResizable(false);
-      await windowManager.setAlwaysOnTop(true);
-      await acrylic.Window.setEffect(
-        effect: acrylic.WindowEffect.transparent,
-        color: const Color(0x00000000),
-      );
-      await windowManager.show();
-      await windowManager.focus();
-    });
-
     runApp(
       SettingsWindowApp(
         store: store,
@@ -87,17 +113,54 @@ Future<void> main(List<String> args) async {
         displays: displays,
       ),
     );
+
+    unawaited(
+      windowManager.waitUntilReadyToShow(settingsOpts, () async {
+        try {
+          await windowManager.setAsFrameless();
+        } catch (_) {}
+        try {
+          await windowManager.setHasShadow(false);
+        } catch (_) {}
+        try {
+          await windowManager.setBackgroundColor(Colors.transparent);
+        } catch (_) {}
+        try {
+          await windowManager.setResizable(false);
+        } catch (_) {}
+        try {
+          await windowManager.setAlwaysOnTop(true);
+        } catch (_) {}
+        try {
+          await windowManager.center();
+        } catch (_) {}
+        try {
+          await windowManager.show();
+          await windowManager.focus();
+        } catch (_) {}
+        try {
+          await acrylic.Window.setEffect(
+            effect: acrylic.WindowEffect.transparent,
+            color: const Color(0x00000000),
+          );
+        } catch (_) {}
+      }),
+    );
     return;
   }
 
   if (dockId == 1) {
-    await hotKeyManager.unregisterAll();
+    try {
+      await hotKeyManager.unregisterAll();
+    } catch (_) {}
   }
 
   final store = await PortableIniStore.load(allowAutoMigrate: dockId == 1);
   AppI18n.loadExternalLanguages(store.languagesDir);
   AppI18n.currentCode = store.global.language;
-  store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
+  try {
+    store.global.launchWithWindows = Win32Bridge.isStartupEnabled();
+  } catch (_) {}
 
   if (dockId == 1) {
     for (final name in ['.aerodock_quit', '.aerodock_hidden']) {
@@ -120,22 +183,39 @@ Future<void> main(List<String> args) async {
     alwaysOnTop: true,
   );
 
-  await windowManager.waitUntilReadyToShow(windowOptions, () async {
-    await windowManager.setAsFrameless();
-    await windowManager.setHasShadow(false);
-    await windowManager.setBackgroundColor(Colors.transparent);
-    await windowManager.setResizable(false);
-    await windowManager.setAlwaysOnTop(cfg.layer == 'top');
-    await acrylic.Window.setEffect(
-      effect: cfg.useAcrylic
-          ? acrylic.WindowEffect.acrylic
-          : acrylic.WindowEffect.transparent,
-      color: cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
-    );
-    await windowManager.show();
-  });
-
+  // Start Flutter widget tree FIRST so waitUntilReadyToShow can never deadlock!
   runApp(AeroDockApp(store: store, dockId: dockId));
+
+  unawaited(
+    windowManager.waitUntilReadyToShow(windowOptions, () async {
+      try {
+        await windowManager.setAsFrameless();
+      } catch (_) {}
+      try {
+        await windowManager.setHasShadow(false);
+      } catch (_) {}
+      try {
+        await windowManager.setBackgroundColor(Colors.transparent);
+      } catch (_) {}
+      try {
+        await windowManager.setResizable(false);
+      } catch (_) {}
+      try {
+        await windowManager.setAlwaysOnTop(cfg.layer == 'top');
+      } catch (_) {}
+      try {
+        await windowManager.show();
+      } catch (_) {}
+      try {
+        await acrylic.Window.setEffect(
+          effect: cfg.useAcrylic
+              ? acrylic.WindowEffect.acrylic
+              : acrylic.WindowEffect.transparent,
+          color: cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
+        );
+      } catch (_) {}
+    }),
+  );
 }
 
 class SettingsWindowApp extends StatelessWidget {
@@ -158,6 +238,8 @@ class SettingsWindowApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Настройки AeroDock',
       theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF0EA5E9),
           brightness: Brightness.dark,
@@ -202,6 +284,21 @@ class _StandaloneSettingsHostState extends State<_StandaloneSettingsHost> {
         await windowManager.destroy();
         exit(0);
       }
+    });
+
+    // Visibility watchdog so the standalone Settings window can never stay hidden
+    Future<void>.delayed(const Duration(milliseconds: 450), () async {
+      if (!mounted) return;
+      try {
+        if (!await windowManager.isVisible()) {
+          await windowManager.show();
+          await windowManager.focus();
+        }
+        final hwnd = Win32Bridge.findOwnWindowHandle();
+        if (hwnd != 0 && !Win32Bridge.isWindowVisible(hwnd)) {
+          Win32Bridge.ensureWindowVisible(hwnd, activate: true);
+        }
+      } catch (_) {}
     });
   }
 
@@ -251,6 +348,8 @@ class AeroDockApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'AeroDock Portable #$dockId',
       theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF0EA5E9),
           brightness: Brightness.dark,
@@ -316,8 +415,10 @@ class _DockShellPageState extends State<DockShellPage>
   bool _isPopupRaised = false;
   bool _suspended = false;
   int _ownHwnd = 0;
+  bool? _lastAppliedUseAcrylic;
 
-  // Cached logical-DIP display rect + DPI scale factor (prevents off-screen clipping on 125%/150% DPI!)
+  // Guaranteed physical Win32 work area + logical DIP work area + exact DPI scale factor
+  Rect _cachedPhysicalWorkRect = const Rect.fromLTWH(0, 0, 1920, 1040);
   Rect _cachedScreenRect = const Rect.fromLTWH(0, 0, 1920, 1040);
   double _displayScaleFactor = 1.0;
   List<Display> _displays = [];
@@ -416,15 +517,25 @@ class _DockShellPageState extends State<DockShellPage>
         if (widget.store.migratedFromPreviousVersion) {
           _showToast('Настройки и иконки автоматически перенесены из предыдущей версии!');
         }
-        // Trigger scheduled auto-backup silently in background
-        unawaited(widget.store.runAutoBackupIfDue());
+        // Delay auto-backup slightly so initial multi-dock startup never races on Settings.ini
+        Future<void>.delayed(const Duration(seconds: 3), () {
+          if (mounted) unawaited(widget.store.runAutoBackupIfDue());
+        });
       }
       _extractMissingIcons();
-      _applyLayerAndAcrylic();
       await _syncWindowGeometry();
+      await _ensureDockVisible();
       _pollWindowsAndRunning();
       _pollStatsNow();
       _pollRecycleBinNow();
+
+      // Safety visibility & geometry check after window_manager/flutter_acrylic finish attaching
+      Future<void>.delayed(const Duration(milliseconds: 550), () async {
+        if (!mounted || _suspended) return;
+        await _refreshDisplaysAndWorkArea();
+        await _syncWindowGeometry();
+        await _ensureDockVisible();
+      });
     });
 
     // 1. Clock ticks ONLY update _nowNotifier (no full-tree rebuild!)
@@ -928,84 +1039,124 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // DPI-Safe Work-Area Positioning (Sits Cleanly ABOVE Windows Taskbar on 100/125/150/200% DPI!)
+  // 100% Exact Physical-Win32 + Logical-DIP Positioning (Never Off-Screen at ANY DPI!)
   // ============================================================================
+
+  double _resolveCurrentDpr({double monitorScaleFallback = 1.0}) {
+    if (_ownHwnd == 0) _ownHwnd = Win32Bridge.findOwnWindowHandle();
+    final winScale = Win32Bridge.getWindowScaleFactor(_ownHwnd, fallback: 0);
+    if (winScale >= 0.75) return winScale;
+    try {
+      final views = WidgetsBinding.instance.platformDispatcher.views;
+      if (views.isNotEmpty && views.first.devicePixelRatio >= 0.75) {
+        return views.first.devicePixelRatio.clamp(0.75, 4.0);
+      }
+    } catch (_) {}
+    return monitorScaleFallback.clamp(0.75, 4.0);
+  }
+
+  Future<void> _ensureDockVisible() async {
+    if (_suspended) return;
+    if (_ownHwnd == 0) _ownHwnd = Win32Bridge.findOwnWindowHandle();
+    try {
+      if (!await windowManager.isVisible()) {
+        await windowManager.show();
+      }
+    } catch (_) {}
+    if (_ownHwnd != 0 && !Win32Bridge.isWindowVisible(_ownHwnd)) {
+      Win32Bridge.ensureWindowVisible(_ownHwnd, activate: _overlay != _ActiveOverlay.none);
+    }
+  }
 
   Future<void> _refreshDisplaysAndWorkArea() async {
     try {
       _displays = await screenRetriever.getAllDisplays();
     } catch (_) {}
 
-    if (_displays.isNotEmpty) {
-      final primary = _displays.first;
-      _displayScaleFactor = (primary.scaleFactor?.toDouble() ?? 1.0).clamp(0.75, 4.0);
-
+    // Always read GUARANTEED physical pixel bounds directly from Win32 EnumDisplayMonitors!
+    // This completely eliminates screen_retriever 0.2.0 physical-vs-logical DPI mismatches
+    // that previously pushed bottom/right docks below the monitor at 125%/150%/200% scaling.
+    final monitors = Win32Bridge.enumerateMonitors();
+    if (monitors.isNotEmpty) {
       if (_cfg.monitorIndex == -1) {
-        // Monitor * (all displays unified in logical DIPs!)
         var minL = double.infinity;
         var minT = double.infinity;
         var maxR = double.negativeInfinity;
         var maxB = double.negativeInfinity;
-        for (final d in _displays) {
-          final pos = d.visiblePosition ?? Offset.zero;
-          final sz = d.visibleSize ?? d.size;
-          minL = math.min(minL, pos.dx);
-          minT = math.min(minT, pos.dy);
-          maxR = math.max(maxR, pos.dx + sz.width);
-          maxB = math.max(maxB, pos.dy + sz.height);
+        for (final m in monitors) {
+          minL = math.min(minL, m.workRect.left);
+          minT = math.min(minT, m.workRect.top);
+          maxR = math.max(maxR, m.workRect.right);
+          maxB = math.max(maxB, m.workRect.bottom);
         }
+        final dpr = _resolveCurrentDpr(monitorScaleFallback: monitors.first.scaleFactor);
+        _displayScaleFactor = dpr;
         if (minL.isFinite && maxR > minL && maxB > minT) {
-          _cachedScreenRect = Rect.fromLTRB(minL, minT, maxR, maxB);
+          _cachedPhysicalWorkRect = Rect.fromLTRB(minL, minT, maxR, maxB);
+          _cachedScreenRect = Rect.fromLTRB(minL / dpr, minT / dpr, maxR / dpr, maxB / dpr);
           return;
         }
       } else {
-        final idx = _cfg.monitorIndex.clamp(0, _displays.length - 1);
-        final d = _displays[idx];
-        _displayScaleFactor = (d.scaleFactor?.toDouble() ?? 1.0).clamp(0.75, 4.0);
-        final pos = d.visiblePosition ?? Offset.zero;
-        final sz = d.visibleSize ?? d.size;
-        if (sz.width > 100 && sz.height > 100) {
-          _cachedScreenRect = Rect.fromLTWH(pos.dx, pos.dy, sz.width, sz.height);
-          return;
-        }
+        final idx = _cfg.monitorIndex.clamp(0, monitors.length - 1);
+        final m = monitors[idx];
+        final dpr = m.scaleFactor >= 0.75
+            ? m.scaleFactor
+            : _resolveCurrentDpr(monitorScaleFallback: 1.0);
+        _displayScaleFactor = dpr;
+        _cachedPhysicalWorkRect = Rect.fromLTWH(
+          m.workRect.left,
+          m.workRect.top,
+          m.workRect.width,
+          m.workRect.height,
+        );
+        _cachedScreenRect = Rect.fromLTWH(
+          m.workRect.left / dpr,
+          m.workRect.top / dpr,
+          m.workRect.width / dpr,
+          m.workRect.height / dpr,
+        );
+        return;
       }
     }
 
-    // Fallback to Win32 physical pixels converted to logical DIPs via _displayScaleFactor
-    final scale = _displayScaleFactor;
-    if (_cfg.monitorIndex == -1) {
-      final v = Win32Bridge.getVirtualScreenRect();
-      _cachedScreenRect = Rect.fromLTWH(
-        v.left / scale,
-        v.top / scale,
-        v.width / scale,
-        v.height / scale,
-      );
-      return;
-    }
-
+    // Fallback to Win32 SPI_GETWORKAREA converted via exact DPR
+    final dpr = _resolveCurrentDpr();
+    _displayScaleFactor = dpr;
     final work = Win32Bridge.getPrimaryWorkArea();
     if (work != null) {
+      _cachedPhysicalWorkRect = Rect.fromLTWH(work.left, work.top, work.width, work.height);
       _cachedScreenRect = Rect.fromLTWH(
-        work.left / scale,
-        work.top / scale,
-        work.width / scale,
-        work.height / scale,
+        work.left / dpr,
+        work.top / dpr,
+        work.width / dpr,
+        work.height / dpr,
       );
     }
   }
 
-  void _applyLayerAndAcrylic() {
+  void _applyLayerAndAcrylic({bool forceAcrylic = false}) {
     if (_ownHwnd == 0) _ownHwnd = Win32Bridge.findOwnWindowHandle();
     final effectiveLayer = _isPopupRaised ? 'top' : _cfg.layer;
-    windowManager.setAlwaysOnTop(effectiveLayer == 'top');
+    try {
+      windowManager.setAlwaysOnTop(effectiveLayer == 'top');
+    } catch (_) {}
     Win32Bridge.setWindowLayer(_ownHwnd, effectiveLayer);
-    acrylic.Window.setEffect(
-      effect: _cfg.useAcrylic
-          ? acrylic.WindowEffect.acrylic
-          : acrylic.WindowEffect.transparent,
-      color: _cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
-    );
+
+    // Only touch flutter_acrylic when the setting actually changes — repeated calls during
+    // resize/move can corrupt the transparent DWM composition surface on Windows 11!
+    if (forceAcrylic || _lastAppliedUseAcrylic != _cfg.useAcrylic) {
+      _lastAppliedUseAcrylic = _cfg.useAcrylic;
+      unawaited(() async {
+        try {
+          await acrylic.Window.setEffect(
+            effect: _cfg.useAcrylic
+                ? acrylic.WindowEffect.acrylic
+                : acrylic.WindowEffect.transparent,
+            color: _cfg.useAcrylic ? const Color(0x550F172A) : const Color(0x00000000),
+          );
+        } catch (_) {}
+      }());
+    }
   }
 
   double _computeItemsMainSpan() {
@@ -1021,7 +1172,11 @@ class _DockShellPageState extends State<DockShellPage>
 
   Future<void> _syncWindowGeometry() async {
     if (_suspended) return;
+    if (_ownHwnd == 0) _ownHwnd = Win32Bridge.findOwnWindowHandle();
+
     final screen = _cachedScreenRect;
+    final physScreen = _cachedPhysicalWorkRect;
+    final dpr = _displayScaleFactor.clamp(0.75, 4.0);
 
     if (_overlay != _ActiveOverlay.none) {
       final w = switch (_overlay) {
@@ -1038,12 +1193,17 @@ class _DockShellPageState extends State<DockShellPage>
         _ActiveOverlay.calendar => 340.0,
         _ => 600.0,
       };
-      final left = screen.left + (screen.width - w) / 2;
-      final top = screen.top + (screen.height - h) / 2;
-      await windowManager.setSize(Size(w, h));
-      await windowManager.setPosition(Offset(left, top));
-      await windowManager.setAlwaysOnTop(true);
-      await windowManager.focus();
+      final clampedW = math.min(w, math.max(320.0, screen.width - 24));
+      final clampedH = math.min(h, math.max(280.0, screen.height - 24));
+      final left = screen.left + (screen.width - clampedW) / 2;
+      final top = screen.top + (screen.height - clampedH) / 2;
+      try {
+        await windowManager.setSize(Size(clampedW, clampedH));
+        await windowManager.setPosition(Offset(left, top));
+        await windowManager.setAlwaysOnTop(true);
+        await windowManager.show();
+        await windowManager.focus();
+      } catch (_) {}
       return;
     }
 
@@ -1059,11 +1219,11 @@ class _DockShellPageState extends State<DockShellPage>
     final double winW;
     final double winH;
     if (_isHorizontal) {
-      winW = math.min(screen.width - 8, mainLen);
-      winH = collapsed ? 8.0 : math.min(screen.height - 16, crossLen);
+      winW = math.min(math.max(220.0, screen.width - 8), mainLen);
+      winH = collapsed ? 8.0 : math.min(math.max(110.0, screen.height - 16), crossLen);
     } else {
-      winW = collapsed ? 8.0 : math.min(screen.width - 16, crossLen + 110);
-      winH = math.min(screen.height - 8, mainLen);
+      winW = collapsed ? 8.0 : math.min(math.max(140.0, screen.width - 16), crossLen + 110);
+      winH = math.min(math.max(220.0, screen.height - 8), mainLen);
     }
 
     final centerShiftX = screen.width * (_cfg.centerOffset / 100);
@@ -1095,21 +1255,57 @@ class _DockShellPageState extends State<DockShellPage>
     x = x.clamp(screen.left, math.max(screen.left, screen.right - winW));
     y = y.clamp(screen.top, math.max(screen.top, screen.bottom - winH));
 
-    await windowManager.setSize(Size(winW, winH));
-    await windowManager.setPosition(Offset(x, y));
+    // Apply logical size & position via window_manager
+    try {
+      await windowManager.setSize(Size(winW, winH));
+      await windowManager.setPosition(Offset(x, y));
+    } catch (_) {}
+
+    // Physical-pixel verification & snap: guarantees the HWND sits 100% INSIDE the monitor's
+    // real Win32 work area even on 125%/150%/200% DPI or mixed-DPI multi-monitor setups!
+    if (_ownHwnd != 0) {
+      final maxW = math.max(8, physScreen.width.round());
+      final maxH = math.max(8, physScreen.height.round());
+      final physW = (winW * dpr).round().clamp(8, maxW);
+      final physH = (winH * dpr).round().clamp(8, maxH);
+      final maxPhysX = math.max(physScreen.left.round(), physScreen.right.round() - physW);
+      final maxPhysY = math.max(physScreen.top.round(), physScreen.bottom.round() - physH);
+      final targetPhysX = (x * dpr).round().clamp(physScreen.left.round(), maxPhysX);
+      final targetPhysY = (y * dpr).round().clamp(physScreen.top.round(), maxPhysY);
+
+      final actual = Win32Bridge.getWindowRect(_ownHwnd);
+      final drifted = actual == null ||
+          (actual.left - targetPhysX).abs() > 4 ||
+          (actual.top - targetPhysY).abs() > 4 ||
+          (actual.width - physW).abs() > 6 ||
+          (actual.height - physH).abs() > 6;
+      if (drifted) {
+        final effectiveLayer = _isPopupRaised ? 'top' : _cfg.layer;
+        Win32Bridge.setWindowBoundsPhysical(
+          _ownHwnd,
+          left: targetPhysX,
+          top: targetPhysY,
+          width: physW,
+          height: physH,
+          layer: effectiveLayer,
+          show: true,
+        );
+      }
+    }
+
     _applyLayerAndAcrylic();
   }
 
-  /// Zero-IPC edge hover detector using DPI-aware logical work area + GetCursorPos.
+  /// Zero-IPC edge hover detector comparing raw physical GetCursorPos directly against physical Win32 rcWork!
   void _checkCursorEdgeHover() {
     if (_overlay != _ActiveOverlay.none) return;
     if (!_cfg.autoHide && (!_cfg.popupOnMouseover || _cfg.layer == 'top')) return;
 
     final rawCursor = Win32Bridge.getCursorPos();
-    final cx = rawCursor.x / _displayScaleFactor;
-    final cy = rawCursor.y / _displayScaleFactor;
-    final screen = _cachedScreenRect;
-    const hotZone = 10.0;
+    final cx = rawCursor.x.toDouble();
+    final cy = rawCursor.y.toDouble();
+    final screen = _cachedPhysicalWorkRect;
+    final hotZone = 10.0 * _displayScaleFactor;
 
     final atEdge = switch (_cfg.position) {
       'top' => cy <= screen.top + hotZone &&
@@ -2255,7 +2451,13 @@ class _DockShellPageState extends State<DockShellPage>
                   ),
 
                   // Icons strip (zero layout reflow on hover — pure GPU Transform!)
-                  _buildIconsAxis(hoverAxis, slotCenters),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      minWidth: _isHorizontal ? 96 : 0,
+                      minHeight: _isHorizontal ? 0 : 96,
+                    ),
+                    child: _buildIconsAxis(hoverAxis, slotCenters),
+                  ),
                 ],
               ),
             ),
