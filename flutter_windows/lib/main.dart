@@ -14,6 +14,7 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'dev_watcher.dart';
 import 'dialogs.dart';
 import 'docklets.dart';
 import 'i18n.dart';
@@ -32,7 +33,7 @@ Future<void> main(List<String> args) async {
   var dockId = 1;
   for (final arg in args) {
     if (arg.startsWith('--dock=')) {
-      dockId = int.tryParse(arg.substring(7))?.clamp(1, 3) ?? 1;
+      dockId = int.tryParse(arg.substring(7))?.clamp(1, 4) ?? 1;
     }
   }
 
@@ -168,10 +169,16 @@ class _DockShellPageState extends State<DockShellPage>
 
   // Overlay dialogs
   _ActiveOverlay _overlay = _ActiveOverlay.none;
+  int _settingsInitialTab = 0;
   DockItemModel? _editingItem;
   String _editorDefaultType = 'file';
   DockItemModel? _openStackItem;
   List<FolderEntryInfo> _stackEntries = [];
+
+  // Dev Panel ("Разработка") GitHub archive watcher & transient toast banner
+  DevArchiveWatcher? _devWatcher;
+  String? _toastMessage;
+  Timer? _toastTimer;
 
   // Minimized Windows (baseline prevents hijacking background windows on startup)
   List<Win32WindowInfo> _openWindows = [];
@@ -231,6 +238,7 @@ class _DockShellPageState extends State<DockShellPage>
         await _initSystemTray();
         await _registerGlobalHotKey();
         await _reconcileSiblingDocks();
+        _initDevWatcher();
       }
       _extractMissingIcons();
       _applyLayerAndAcrylic();
@@ -293,6 +301,8 @@ class _DockShellPageState extends State<DockShellPage>
     _edgeHoverTimer?.cancel();
     _autoHideDelayTimer?.cancel();
     _popupDelayTimer?.cancel();
+    _toastTimer?.cancel();
+    _devWatcher?.stop();
     _hoverAxisNotifier.dispose();
     _nowNotifier.dispose();
     _batteryNotifier.dispose();
@@ -307,6 +317,42 @@ class _DockShellPageState extends State<DockShellPage>
       _killAllChildDocks();
     }
     super.dispose();
+  }
+
+  void _initDevWatcher() {
+    if (!_isPrimary) return;
+    _devWatcher ??= DevArchiveWatcher(
+      store: widget.store,
+      onDeployed: (event) async {
+        await _reconcileSiblingDocks();
+        await _rebuildTrayMenu();
+        final verb = event.wasUpgrade ? 'Обновлено' : 'Установлено';
+        final cfgNote = event.wasUpgrade && event.preservedConfigCount > 0
+            ? ' · настроек перенесено: ${event.preservedConfigCount}'
+            : '';
+        _showToast('Разработка: $verb «${event.rule.name}» (v${event.rule.versionCount})$cfgNote');
+        if (mounted) setState(() {});
+      },
+    );
+    _reconcileDevWatcher();
+  }
+
+  void _reconcileDevWatcher() {
+    if (!_isPrimary || _devWatcher == null) return;
+    if (!_suspended && widget.store.global.devDockEnabled) {
+      _devWatcher!.start();
+    } else {
+      _devWatcher!.stop();
+    }
+  }
+
+  void _showToast(String msg) {
+    _toastTimer?.cancel();
+    if (!mounted) return;
+    setState(() => _toastMessage = msg);
+    _toastTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _toastMessage = null);
+    });
   }
 
   void _pollStatsNow() {
@@ -328,16 +374,15 @@ class _DockShellPageState extends State<DockShellPage>
   }
 
   // ============================================================================
-  // Multi-Dock Orchestration (1, 2, or 3 independent docks)
+  // Multi-Dock Orchestration (Docks 1, 2, 3 + Dock 4 "Разработка")
   // ============================================================================
 
   Future<void> _reconcileSiblingDocks() async {
     if (!_isPrimary) return;
-    final desired = widget.store.global.dockCount.clamp(1, 3);
     final exe = Platform.resolvedExecutable;
 
-    for (var id = 2; id <= 3; id++) {
-      final shouldRun = id <= desired;
+    for (var id = 2; id <= 4; id++) {
+      final shouldRun = widget.store.global.isDockEnabled(id);
       final running = _childDocks[id];
       if (shouldRun && running == null) {
         try {
@@ -352,6 +397,7 @@ class _DockShellPageState extends State<DockShellPage>
         _childDocks.remove(id);
       }
     }
+    _reconcileDevWatcher();
   }
 
   void _killAllChildDocks() {
@@ -379,11 +425,12 @@ class _DockShellPageState extends State<DockShellPage>
         _applyLayerAndAcrylic();
         await _syncWindowGeometry();
       }
+      _reconcileDevWatcher();
       if (mounted) setState(() {});
     }
 
-    // Only check external INI changes when multi-dock is active
-    if (widget.store.global.dockCount > 1 || !_isPrimary) {
+    // Sync Settings.ini across Dock 1..4 whenever multi-dock is active
+    if (widget.store.global.activeDockCount > 1 || !_isPrimary) {
       if (await widget.store.hasExternalChanges()) {
         await widget.store.reloadFromDisk();
         AppI18n.currentCode = widget.store.global.language;
@@ -394,10 +441,11 @@ class _DockShellPageState extends State<DockShellPage>
           await _reconcileSiblingDocks();
           await _rebuildTrayMenu();
         }
-        if (_dockId > widget.store.global.dockCount && !_isPrimary) {
+        if (!_isPrimary && !widget.store.global.isDockEnabled(_dockId)) {
           await _exitSingleInstance();
           return;
         }
+        _extractMissingIcons();
         _applyLayerAndAcrylic();
         await _syncWindowGeometry();
         if (mounted) setState(() {});
@@ -409,6 +457,7 @@ class _DockShellPageState extends State<DockShellPage>
     try {
       await _quitSignalFile.writeAsString('quit', flush: true);
     } catch (_) {}
+    _devWatcher?.stop();
     _restoreAllHiddenWindows();
     _killAllChildDocks();
     await _exitSingleInstance();
@@ -416,6 +465,7 @@ class _DockShellPageState extends State<DockShellPage>
 
   Future<void> _exitSingleInstance() async {
     if (_isPrimary) {
+      _devWatcher?.stop();
       _restoreAllHiddenWindows();
       await hotKeyManager.unregisterAll();
       await trayManager.destroy();
@@ -438,15 +488,19 @@ class _DockShellPageState extends State<DockShellPage>
 
   Future<void> _rebuildTrayMenu() async {
     try {
+      final g = widget.store.global;
       await trayManager.setContextMenu(
         Menu(
           items: [
             MenuItem(key: 'toggle', label: AppI18n.t('show_hide_hotkey')),
             MenuItem(key: 'settings', label: '${AppI18n.t('dock_settings')}…'),
+            MenuItem(key: 'settings_panels', label: 'Управление панелями (1–3)…'),
+            MenuItem(key: 'settings_dev', label: 'Панель «Разработка» (GitHub)…'),
+            MenuItem(key: 'import_rd135', label: 'Импорт RocketDock 1.3.5 (.ini)…'),
             MenuItem.separator(),
-            MenuItem(key: 'docks_1', label: '1 панель${widget.store.global.dockCount == 1 ? ' ✓' : ''}'),
-            MenuItem(key: 'docks_2', label: '2 панели${widget.store.global.dockCount == 2 ? ' ✓' : ''}'),
-            MenuItem(key: 'docks_3', label: '3 панели${widget.store.global.dockCount == 3 ? ' ✓' : ''}'),
+            MenuItem(key: 'toggle_dock2', label: 'Панель 2 (Справа)${g.dock2Enabled ? ' ✓' : ''}'),
+            MenuItem(key: 'toggle_dock3', label: 'Панель 3 (Сверху)${g.dock3Enabled ? ' ✓' : ''}'),
+            MenuItem(key: 'toggle_dock4', label: 'Панель «Разработка» (Слева)${g.devDockEnabled ? ' ✓' : ''}'),
             MenuItem.separator(),
             MenuItem(key: 'open_dir', label: 'Открыть папку AeroDock'),
             MenuItem(key: 'quit', label: AppI18n.t('quit')),
@@ -470,13 +524,34 @@ class _DockShellPageState extends State<DockShellPage>
         break;
       case 'settings':
         if (_suspended) await _toggleGlobalSuspend();
-        await _openOverlay(_ActiveOverlay.settings);
+        await _openSettingsTab(0);
         break;
-      case 'docks_1':
-      case 'docks_2':
-      case 'docks_3':
-        final count = int.parse(menuItem.key!.split('_').last);
-        widget.store.global.dockCount = count;
+      case 'settings_panels':
+        if (_suspended) await _toggleGlobalSuspend();
+        await _openSettingsTab(1);
+        break;
+      case 'settings_dev':
+        if (_suspended) await _toggleGlobalSuspend();
+        await _openSettingsTab(2);
+        break;
+      case 'import_rd135':
+        if (_suspended) await _toggleGlobalSuspend();
+        await _importRocketDock135ViaPicker();
+        break;
+      case 'toggle_dock2':
+        widget.store.global.dock2Enabled = !widget.store.global.dock2Enabled;
+        await widget.store.save();
+        await _reconcileSiblingDocks();
+        await _rebuildTrayMenu();
+        break;
+      case 'toggle_dock3':
+        widget.store.global.dock3Enabled = !widget.store.global.dock3Enabled;
+        await widget.store.save();
+        await _reconcileSiblingDocks();
+        await _rebuildTrayMenu();
+        break;
+      case 'toggle_dock4':
+        widget.store.global.devDockEnabled = !widget.store.global.devDockEnabled;
         await widget.store.save();
         await _reconcileSiblingDocks();
         await _rebuildTrayMenu();
@@ -519,6 +594,7 @@ class _DockShellPageState extends State<DockShellPage>
       _applyLayerAndAcrylic();
       await _syncWindowGeometry();
     }
+    _reconcileDevWatcher();
     if (mounted) setState(() {});
   }
 
@@ -714,18 +790,18 @@ class _DockShellPageState extends State<DockShellPage>
 
     if (_overlay != _ActiveOverlay.none) {
       final w = switch (_overlay) {
-        _ActiveOverlay.settings => 760.0,
-        _ActiveOverlay.iconSettings => 760.0,
+        _ActiveOverlay.settings => 810.0,
+        _ActiveOverlay.iconSettings => 770.0,
         _ActiveOverlay.stack => 560.0,
         _ActiveOverlay.calendar => 340.0,
-        _ => 760.0,
+        _ => 810.0,
       };
       final h = switch (_overlay) {
-        _ActiveOverlay.settings => 560.0,
+        _ActiveOverlay.settings => 590.0,
         _ActiveOverlay.iconSettings => 560.0,
         _ActiveOverlay.stack => 410.0,
         _ActiveOverlay.calendar => 340.0,
-        _ => 560.0,
+        _ => 590.0,
       };
       final left = screen.left + (screen.width - w) / 2;
       final top = screen.top + (screen.height - h) / 2;
@@ -877,7 +953,10 @@ class _DockShellPageState extends State<DockShellPage>
       case 'separator':
         return;
       case 'dock_settings':
-        await _openOverlay(_ActiveOverlay.settings);
+        await _openSettingsTab(0);
+        return;
+      case 'dev_settings':
+        await _openSettingsTab(2);
         return;
       case 'quit':
         await _quitAllDocks();
@@ -968,10 +1047,50 @@ class _DockShellPageState extends State<DockShellPage>
     return null;
   }
 
+  Future<void> _importRocketDock135ViaPicker() async {
+    final res = await FilePicker.platform.pickFiles(
+      dialogTitle: 'Выберите Settings.ini из RocketDock 1.3.5',
+      type: FileType.custom,
+      allowedExtensions: ['ini'],
+    );
+    if (res == null || res.files.single.path == null) return;
+    final importRes = await widget.store.importRocketDock135Ini(
+      File(res.files.single.path!),
+      targetDockId: _dockId,
+    );
+    _extractMissingIcons();
+    _applyLayerAndAcrylic();
+    await _syncWindowGeometry();
+    _showToast(importRes.message);
+    if (mounted) setState(() {});
+  }
+
   Future<void> _handleExternalDrop(DropDoneDetails details) async {
     setState(() => _isDraggingFile = false);
     final paths = details.files.map((f) => f.path).where((s) => s.isNotEmpty).toList();
     if (paths.isEmpty) return;
+
+    // Auto-import RocketDock 1.3.5 Settings.ini if dropped directly onto the dock!
+    if (paths.length == 1 && p.extension(paths.first).toLowerCase() == '.ini') {
+      try {
+        final iniFile = File(paths.first);
+        final sections = PortableIniStore.parseIniText(
+          decodeWindowsIniBytes(await iniFile.readAsBytes()),
+        );
+        if (PortableIniStore.isRocketDock135Ini(sections)) {
+          final importRes = await widget.store.importRocketDock135Ini(
+            iniFile,
+            targetDockId: _dockId,
+          );
+          _extractMissingIcons();
+          _applyLayerAndAcrylic();
+          await _syncWindowGeometry();
+          _showToast(importRes.message);
+          if (mounted) setState(() {});
+          return;
+        }
+      } catch (_) {}
+    }
 
     final hoveredIdx = _hitTestItemIndex(_hoverAxisNotifier.value);
     if (hoveredIdx != null && hoveredIdx >= 0 && hoveredIdx < _items.length) {
@@ -1026,6 +1145,11 @@ class _DockShellPageState extends State<DockShellPage>
     await _syncWindowGeometry();
   }
 
+  Future<void> _openSettingsTab(int tab) async {
+    _settingsInitialTab = tab;
+    await _openOverlay(_ActiveOverlay.settings);
+  }
+
   Future<void> _openOverlay(_ActiveOverlay next) async {
     _hoverAxisNotifier.value = null;
     setState(() {
@@ -1071,6 +1195,14 @@ class _DockShellPageState extends State<DockShellPage>
       if (item.type != 'separator') {
         entries.add(PopupMenuItem(value: 'item_edit', child: Text('${AppI18n.t('icon_settings')}…')));
       }
+      if (item.devRuleId != null) {
+        entries.addAll(const [
+          PopupMenuItem(value: 'dev_open_app_dir', child: Text('📂 Открыть папку программы')),
+          PopupMenuItem(value: 'dev_open_backups', child: Text('🗂 Открыть бэкапы (старые версии)')),
+          PopupMenuItem(value: 'dev_rollback', child: Text('⏪ Откатить к прошлой версии')),
+          PopupMenuItem(value: 'open_dev_settings', child: Text('⚙ Правила «Разработка»…')),
+        ]);
+      }
       if (item.type == 'recycle_bin' && item.popupMenu) {
         entries.add(
           PopupMenuItem(
@@ -1088,6 +1220,7 @@ class _DockShellPageState extends State<DockShellPage>
       entries.add(const PopupMenuDivider());
     }
 
+    final g = widget.store.global;
     entries.addAll([
       PopupMenuItem(value: 'add_file', child: Text('＋ ${AppI18n.t('add_file')}')),
       PopupMenuItem(value: 'add_path', child: Text('＋ ${AppI18n.t('add_path')}')),
@@ -1111,16 +1244,33 @@ class _DockShellPageState extends State<DockShellPage>
       PopupMenuItem(value: 'pos_right', child: Text('${AppI18n.t('pos_right')}${_cfg.position == 'right' ? ' ✓' : ''}')),
       const PopupMenuDivider(),
       PopupMenuItem(
+        value: 'toggle_dock2',
+        child: Text('🖥 Панель 2 (Справа)${g.dock2Enabled ? ' ✓' : ''}'),
+      ),
+      PopupMenuItem(
+        value: 'toggle_dock3',
+        child: Text('🖥 Панель 3 (Сверху)${g.dock3Enabled ? ' ✓' : ''}'),
+      ),
+      PopupMenuItem(
+        value: 'toggle_dock4',
+        child: Text('⚡ Панель «Разработка» (Слева)${g.devDockEnabled ? ' ✓' : ''}'),
+      ),
+      const PopupMenuDivider(),
+      PopupMenuItem(
+        value: 'import_rd135',
+        child: const Text('📥 Импорт RocketDock 1.3.5 (.ini)…'),
+      ),
+      PopupMenuItem(
+        value: 'open_dev_settings',
+        child: const Text('⚙ Правила «Разработка» (GitHub)…'),
+      ),
+      PopupMenuItem(
         value: 'toggle_lock',
-        child: Text('${AppI18n.t('lock_items')}${widget.store.global.lockItems ? ' ✓' : ''}'),
+        child: Text('${AppI18n.t('lock_items')}${g.lockItems ? ' ✓' : ''}'),
       ),
       PopupMenuItem(
         value: 'toggle_autohide',
         child: Text('${AppI18n.t('auto_hide')}${_cfg.autoHide ? ' ✓' : ''}'),
-      ),
-      PopupMenuItem(
-        value: 'docks_cycle',
-        child: Text('${AppI18n.t('multi_dock')}: ${widget.store.global.dockCount} → ${(widget.store.global.dockCount % 3) + 1}'),
       ),
       const PopupMenuDivider(),
       PopupMenuItem(value: 'open_settings', child: Text('⚙ ${AppI18n.t('dock_settings')}…')),
@@ -1309,8 +1459,50 @@ class _DockShellPageState extends State<DockShellPage>
         setState(() {});
         await _syncWindowGeometry();
         break;
-      case 'docks_cycle':
-        widget.store.global.dockCount = (widget.store.global.dockCount % 3) + 1;
+      case 'dev_open_app_dir':
+        if (item?.devRuleId != null) {
+          final rule = widget.store.devSettings.rules
+              .where((r) => r.id == item!.devRuleId)
+              .firstOrNull;
+          if (rule != null) {
+            final watcher = _devWatcher ?? DevArchiveWatcher(store: widget.store, onDeployed: (_) {});
+            final dir = watcher.appDirectoryFor(rule);
+            if (!dir.existsSync()) dir.createSync(recursive: true);
+            Win32Bridge.shellExecute(target: dir.path);
+          }
+        }
+        break;
+      case 'dev_open_backups':
+        if (item?.devRuleId != null) {
+          final rule = widget.store.devSettings.rules
+              .where((r) => r.id == item!.devRuleId)
+              .firstOrNull;
+          if (rule != null) {
+            final watcher = _devWatcher ?? DevArchiveWatcher(store: widget.store, onDeployed: (_) {});
+            final dir = watcher.backupsDirectoryFor(rule);
+            if (!dir.existsSync()) dir.createSync(recursive: true);
+            Win32Bridge.shellExecute(target: dir.path);
+          }
+        }
+        break;
+      case 'dev_rollback':
+        if (item?.devRuleId != null) {
+          final rule = widget.store.devSettings.rules
+              .where((r) => r.id == item!.devRuleId)
+              .firstOrNull;
+          if (rule != null) {
+            final watcher = _devWatcher ?? DevArchiveWatcher(store: widget.store, onDeployed: (_) {});
+            final restored = await watcher.rollbackLatestBackup(rule);
+            _showToast(
+              restored != null
+                  ? 'Откат «${rule.name}» выполнен: $restored'
+                  : 'Для «${rule.name}» пока нет сохранённых бэкапов.',
+            );
+          }
+        }
+        break;
+      case 'toggle_dock2':
+        widget.store.global.dock2Enabled = !widget.store.global.dock2Enabled;
         await widget.store.save();
         if (_isPrimary) {
           await _reconcileSiblingDocks();
@@ -1318,8 +1510,32 @@ class _DockShellPageState extends State<DockShellPage>
         }
         setState(() {});
         break;
+      case 'toggle_dock3':
+        widget.store.global.dock3Enabled = !widget.store.global.dock3Enabled;
+        await widget.store.save();
+        if (_isPrimary) {
+          await _reconcileSiblingDocks();
+          await _rebuildTrayMenu();
+        }
+        setState(() {});
+        break;
+      case 'toggle_dock4':
+        widget.store.global.devDockEnabled = !widget.store.global.devDockEnabled;
+        await widget.store.save();
+        if (_isPrimary) {
+          await _reconcileSiblingDocks();
+          await _rebuildTrayMenu();
+        }
+        setState(() {});
+        break;
+      case 'import_rd135':
+        await _importRocketDock135ViaPicker();
+        break;
+      case 'open_dev_settings':
+        await _openSettingsTab(2);
+        break;
       case 'open_settings':
-        await _openOverlay(_ActiveOverlay.settings);
+        await _openSettingsTab(0);
         break;
       case 'quit':
         await _quitAllDocks();
@@ -1509,7 +1725,9 @@ class _DockShellPageState extends State<DockShellPage>
             _ActiveOverlay.settings => DockSettingsDialog(
                 store: widget.store,
                 activeDockId: _dockId,
+                initialTab: _settingsInitialTab,
                 displays: _displays,
+                devWatcher: _devWatcher,
                 onSaved: () async {
                   _externalSkins = widget.store.scanExternalSkins();
                   await _refreshDisplaysAndWorkArea();
@@ -1517,6 +1735,7 @@ class _DockShellPageState extends State<DockShellPage>
                     await _reconcileSiblingDocks();
                     await _rebuildTrayMenu();
                   }
+                  _extractMissingIcons();
                   _applyLayerAndAcrylic();
                   if (mounted) setState(() {});
                 },
@@ -1529,7 +1748,10 @@ class _DockShellPageState extends State<DockShellPage>
                 onFullReset: () async {
                   await widget.store.fullReset();
                   await _refreshDisplaysAndWorkArea();
-                  if (_isPrimary) await _reconcileSiblingDocks();
+                  if (_isPrimary) {
+                    await _reconcileSiblingDocks();
+                    await _rebuildTrayMenu();
+                  }
                   _applyLayerAndAcrylic();
                   if (mounted) setState(() {});
                 },
@@ -1663,8 +1885,8 @@ class _DockShellPageState extends State<DockShellPage>
       clipBehavior: Clip.none,
       fit: StackFit.expand,
       children: [
-        // Floating hover label (always well above zoomed icons, never clipped)
-        if (hoveredLabel != null)
+        // Floating hover label or Dev/Import toast (always cleanly above shelf)
+        if (_toastMessage != null || hoveredLabel != null)
           Align(
             alignment: switch (_cfg.position) {
               'top' => Alignment.bottomCenter,
@@ -1674,7 +1896,29 @@ class _DockShellPageState extends State<DockShellPage>
             },
             child: Padding(
               padding: const EdgeInsets.all(6),
-              child: _buildStyledLabel(hoveredLabel),
+              child: _toastMessage != null
+                  ? Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xEE4C1D95),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xCCA78BFA)),
+                        boxShadow: const [
+                          BoxShadow(color: Color(0x88000000), blurRadius: 10, offset: Offset(0, 3)),
+                        ],
+                      ),
+                      child: Text(
+                        _toastMessage!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    )
+                  : _buildStyledLabel(hoveredLabel!),
             ),
           ),
 

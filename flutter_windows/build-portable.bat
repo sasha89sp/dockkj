@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ============================================================
-echo   AeroDock Portable v3.0 — Сборка Windows Release (Flutter)
+echo   AeroDock Portable v3.5 — Сборка Windows Release (Flutter)
 echo ============================================================
 echo.
 
@@ -24,6 +24,7 @@ mkdir "dist\AeroDock-Portable\Skins"
 mkdir "dist\AeroDock-Portable\Icons"
 mkdir "dist\AeroDock-Portable\Docklets"
 mkdir "dist\AeroDock-Portable\Languages"
+mkdir "dist\AeroDock-Portable\DevApps"
 
 xcopy /e /i /y "build\windows\x64\runner\Release\*" "dist\AeroDock-Portable\" >nul
 if exist "Settings.ini" copy /y "Settings.ini" "dist\AeroDock-Portable\Settings.ini" >nul

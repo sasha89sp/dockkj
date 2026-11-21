@@ -49,13 +49,13 @@ jobs:
       - name: Build Windows Release (.exe)
         run: flutter build windows --release
 
-      - name: Package Portable ZIP (Settings.ini + Skins + Icons + Docklets + Languages)
+      - name: Package Portable ZIP (Settings.ini + Skins + Icons + Docklets + Languages + DevApps)
         shell: pwsh
         run: |
           $out = "dist/AeroDock-Portable"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" "$out/"
-          foreach ($dir in @("Skins", "Icons", "Docklets", "Languages")) {
+          foreach ($dir in @("Skins", "Icons", "Docklets", "Languages", "DevApps")) {
             New-Item -ItemType Directory -Force -Path "$out/$dir" | Out-Null
           }
           if (Test-Path "Settings.ini") {
@@ -82,4 +82,4 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release create $tag "dist/AeroDock-Windows-Portable-x64.zip" `
             --title "AeroDock Portable $tag" `
-            --notes "Портативная сборка AeroDock v3.0 (Flutter + Native Win32 FFI, 1-3 панели, Settings.ini, Доклеты, Скины, Сворачивание окон). Распакуйте и запустите aerodock.exe."
+            --notes "Портативная сборка AeroDock v3.5 (RocketDock 1.3.5 INI импорт, независимые панели 1-3, панель «Разработка» с перехватом архивов GitHub, бэкапами и переносом настроек). Распакуйте и запустите aerodock.exe."
